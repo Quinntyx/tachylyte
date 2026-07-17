@@ -1,76 +1,42 @@
-//! Small, data-only graph scene primitives for the workspace shell.
+//! Adapter for mounting the native graph surface in the workspace shell.
 
-use gpui::{div, prelude::*, px, rgb, AnyElement};
+use gpui::{AppContext, Context, Entity};
+use tachylyte_graph_ui::{GraphEvent, GraphView};
+use tachylyte_knowledge::VaultIndex;
 
-const PURPLE: u32 = 0x7852ee;
-const PURPLE_TINT: u32 = 0xf0ebff;
-const INK: u32 = 0x292433;
-const MUTED: u32 = 0x756d7f;
-const LINE: u32 = 0xd8d1df;
-
-/// Builds a compact graph scene for the supplied note paths.
+/// Owns a mounted [`GraphView`] and provides the shell lifecycle operations.
 ///
-/// The scene always starts at a purple `Current / Welcome` node, followed by
-/// one card for each path. Consecutive cards are separated by visible edge
-/// glyphs, keeping the helper useful even when the caller has no link graph
-/// beyond a list of notes.
-///
-/// `selected_path` is compared literally with each entry in `note_paths`.
-/// Matching cards receive the same purple accent as the current node.
-pub fn graph_scene(note_paths: &[String], selected_path: &str) -> AnyElement {
-    let mut scene = div()
-        .w_full()
-        .min_h(px(180.))
-        .p_5()
-        .flex()
-        .items_center()
-        .gap_3()
-        .overflow_hidden()
-        .bg(rgb(0xfaf8fc));
+/// The shell can retain this value alongside its other entities, call
+/// [`GraphMount::sync`] after replacing its vault snapshot, and drain user
+/// interaction with [`GraphMount::drain_events`].
+#[derive(Clone, Debug)]
+pub struct GraphMount {
+    view: Entity<GraphView>,
+}
 
-    scene = scene.child(graph_node("Current / Welcome", true, true));
-
-    for (index, path) in note_paths.iter().enumerate() {
-        scene = scene.child(graph_edge(index));
-        scene = scene.child(graph_node(path, false, path == selected_path));
+impl GraphMount {
+    /// Construct and mount a graph entity from the current index snapshot.
+    pub fn mount<T>(index: &VaultIndex, cx: &mut Context<T>) -> Self {
+        Self {
+            view: cx.new(|_| GraphView::from_index(index)),
+        }
     }
 
-    scene.into_any_element()
-}
+    /// Return the entity so a shell can place it in its layout.
+    pub fn entity(&self) -> Entity<GraphView> {
+        self.view.clone()
+    }
 
-fn graph_edge(index: usize) -> impl IntoElement {
-    div()
-        .id(("graph-edge", index))
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_color(rgb(MUTED))
-        .child(div().w(px(28.)).h(px(1.)).bg(rgb(LINE)))
-        .child("›")
-}
+    /// Refresh graph data while retaining the graph view's UI state.
+    pub fn sync<T>(&self, index: &VaultIndex, cx: &mut Context<T>) {
+        self.view.update(cx, |view, cx| {
+            view.update(index);
+            cx.notify();
+        });
+    }
 
-fn graph_node(label: &str, current: bool, selected: bool) -> impl IntoElement {
-    let accent = current || selected;
-    let border = if accent { PURPLE } else { LINE };
-    let background = if current { PURPLE_TINT } else { 0xffffff };
-    let caption = if current {
-        "START"
-    } else if selected {
-        "SELECTED"
-    } else {
-        "NOTE"
-    };
-
-    div()
-        .flex_shrink_0()
-        .min_w(px(150.))
-        .max_w(px(240.))
-        .p_3()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(border))
-        .bg(rgb(background))
-        .text_color(rgb(INK))
-        .child(div().text_xs().text_color(rgb(PURPLE)).child(caption))
-        .child(div().mt_1().text_sm().child(label.to_owned()))
+    /// Drain selection and open events emitted by the graph since the last call.
+    pub fn drain_events<T>(&self, cx: &mut Context<T>) -> Vec<GraphEvent> {
+        self.view.update(cx, |view, _| view.take_events())
+    }
 }

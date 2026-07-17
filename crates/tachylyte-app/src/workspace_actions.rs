@@ -20,6 +20,7 @@ impl AppController {
         }
 
         let had_document = self.document.take().is_some();
+        self.selected_path = None;
         self.status = if had_document {
             "Document closed".into()
         } else {

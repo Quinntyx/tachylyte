@@ -15,14 +15,20 @@ use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
 use tachylyte_markdown::{EditorDocument, ViewMode};
 
+mod editor_surface;
 mod graph_view;
+mod settings_surface;
 mod tab_notice;
 mod tab_policy;
 mod theme_helpers;
+mod workflow_surface;
 mod workspace_actions;
 
-use graph_view::graph_scene;
+use editor_surface::EditorSurface;
+use graph_view::GraphMount;
+use settings_surface::SettingsSurface;
 use theme_helpers::UiPalette;
+use workflow_surface::{CommandPaletteSurface, QuickSwitcherSurface};
 
 /// The visual palette used by the shell.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -32,6 +38,33 @@ pub enum Theme {
     Dark,
     /// Light paper palette.
     Light,
+}
+
+/// The routed surface for the currently selected vault entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeafKind {
+    /// A Markdown document rendered by `MarkdownEditor`.
+    Markdown,
+    /// An Obsidian Canvas document routed to the structured leaf state.
+    Canvas,
+    /// A Bases document routed to the structured leaf state.
+    Bases,
+    /// An image, audio, video, or PDF routed to the media leaf state.
+    Media(FileKind),
+    /// No file is currently selected.
+    Empty,
+}
+
+impl LeafKind {
+    fn from_entry(entry: &VaultEntry) -> Self {
+        match entry.kind {
+            FileKind::Markdown => Self::Markdown,
+            FileKind::Canvas => Self::Canvas,
+            FileKind::Image | FileKind::Audio | FileKind::Video | FileKind::Pdf => {
+                Self::Media(entry.kind)
+            }
+        }
+    }
 }
 
 /// A named, independently switchable view or action.
@@ -139,6 +172,8 @@ pub struct AppController {
     pub entries: Vec<VaultEntry>,
     /// Current Markdown file.
     pub document: Option<OpenDocument>,
+    /// Currently selected path, including non-Markdown leaves.
+    pub selected_path: Option<VaultPath>,
     /// Searchable knowledge index.
     pub index: VaultIndex,
     /// Frame settings.
@@ -163,6 +198,7 @@ impl AppController {
             vault: None,
             entries: Vec::new(),
             document: None,
+            selected_path: None,
             index: VaultIndex::new(),
             settings: load_settings(),
             query: String::new(),
@@ -192,6 +228,7 @@ impl AppController {
                 self.vault = Some(vault);
                 self.entries = entries;
                 self.document = None;
+                self.selected_path = None;
                 self.rebuild_index();
                 self.status = if self.entries.is_empty() {
                     "Vault is empty".into()
@@ -233,16 +270,13 @@ impl AppController {
             }
         }
     }
-    /// Select a Markdown file and parse it through tachylyte-markdown.
+    /// Select a scanned file and route it to its typed workspace leaf.
     pub fn select(&mut self, path: &VaultPath) -> bool {
-        if !self
-            .entries
-            .iter()
-            .any(|entry| entry.kind == FileKind::Markdown && entry.path == *path)
-        {
-            self.status = format!("Not a scanned Markdown file: {path}");
+        let Some(entry) = self.entries.iter().find(|entry| entry.path == *path) else {
+            self.status = format!("Not a scanned vault file: {path}");
             return false;
-        }
+        };
+        let leaf = LeafKind::from_entry(entry);
         if self
             .document
             .as_ref()
@@ -255,17 +289,23 @@ impl AppController {
             self.status = "Open a vault first".into();
             return false;
         };
-        match vault.read(path).and_then(|b| {
-            String::from_utf8(b).map_err(|e| tachylyte_core::CoreError::Unsupported(e.to_string()))
-        }) {
-            Ok(source) => {
-                self.cursor = source.len();
-                self.document = Some(OpenDocument {
-                    path: path.clone(),
-                    editor: EditorDocument::new(source),
-                    mode: ViewMode::Source,
-                });
-                self.status = path.to_string();
+        let result = vault.read(path);
+        match result {
+            Ok(bytes) => {
+                self.selected_path = Some(path.clone());
+                self.cursor = 0;
+                match String::from_utf8(bytes) {
+                    Ok(source) => {
+                        self.cursor = source.len();
+                        self.document = Some(OpenDocument {
+                            path: path.clone(),
+                            editor: EditorDocument::new(source),
+                            mode: ViewMode::Source,
+                        });
+                    }
+                    Err(_) => self.document = None,
+                }
+                self.status = format!("{} · {:?}", path, leaf);
                 true
             }
             Err(e) => {
@@ -273,6 +313,20 @@ impl AppController {
                 false
             }
         }
+    }
+
+    /// Return the typed leaf route for the current selection.
+    pub fn leaf_kind(&self) -> LeafKind {
+        let Some(path) = &self.selected_path else {
+            return LeafKind::Empty;
+        };
+        if path.as_path().extension().and_then(|e| e.to_str()) == Some("base") {
+            return LeafKind::Bases;
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.path == *path)
+            .map_or(LeafKind::Empty, LeafKind::from_entry)
     }
     /// Set source cursor, clamped to a UTF-8 boundary.
     pub fn set_cursor(&mut self, byte: usize) {
@@ -964,12 +1018,173 @@ pub struct Shell {
     pub controller: AppController,
     /// Focus target for keyboard editing.
     pub focus_handle: FocusHandle,
+    graph: Option<GraphMount>,
+    editor: Option<EditorSurface>,
+    settings_surface: Option<SettingsSurface>,
+    command_palette: Option<CommandPaletteSurface>,
+    quick_switcher: Option<QuickSwitcherSurface>,
+    settings_open: bool,
+    quick_switcher_open: bool,
 }
 impl Shell {
     fn with_controller(controller: AppController, cx: &mut Context<Self>) -> Self {
         Self {
             controller,
             focus_handle: cx.focus_handle(),
+            graph: None,
+            editor: None,
+            settings_surface: None,
+            command_palette: None,
+            quick_switcher: None,
+            settings_open: false,
+            quick_switcher_open: false,
+        }
+    }
+
+    fn ensure_surfaces(&mut self, cx: &mut Context<Self>) {
+        if self.graph.is_none() {
+            self.graph = Some(GraphMount::mount(&self.controller.index, cx));
+        } else if let Some(graph) = &self.graph {
+            graph.sync(&self.controller.index, cx);
+        }
+        let source = self
+            .controller
+            .document
+            .as_ref()
+            .map_or_else(String::new, |d| d.editor.source().to_owned());
+        let mode = self
+            .controller
+            .document
+            .as_ref()
+            .map_or(ViewMode::Source, |d| d.mode);
+        if let Some(editor) = &self.editor {
+            editor.sync(source, mode, cx);
+        } else {
+            self.editor = Some(EditorSurface::mount(source, mode, cx));
+        }
+        if self.settings_surface.is_none() {
+            self.settings_surface = Some(SettingsSurface::new(cx));
+        }
+        if self.command_palette.is_none() {
+            self.command_palette = Some(CommandPaletteSurface::from_commands(
+                [
+                    ("save", "Save current file"),
+                    ("mode.source", "Open source mode"),
+                    ("mode.reading", "Open reading mode"),
+                    ("sidebar.left", "Toggle explorer sidebar"),
+                    ("sidebar.right", "Toggle graph sidebar"),
+                    ("theme.toggle", "Toggle theme"),
+                    ("quick-switcher", "Open quick switcher"),
+                    ("manage vaults", "Manage vaults"),
+                ],
+                cx,
+            ));
+        }
+        if self.quick_switcher.is_none() {
+            self.quick_switcher = Some(QuickSwitcherSurface::from_paths(
+                self.controller
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.path.to_string(), entry.path.to_string())),
+                cx,
+            ));
+        }
+    }
+
+    fn apply_surface_events(&mut self, cx: &mut Context<Self>) {
+        if let Some(graph) = &self.graph {
+            for event in graph.drain_events(cx) {
+                match event {
+                    tachylyte_graph_ui::GraphEvent::Select(path)
+                    | tachylyte_graph_ui::GraphEvent::Open(path) => {
+                        if let Ok(path) = VaultPath::new(path) {
+                            let _ = self.controller.select(&path);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(editor) = &self.editor {
+            for event in editor.drain_events(cx) {
+                match event {
+                    tachylyte_editor_ui::EditorEvent::Changed { .. } => {
+                        let source = editor.entity().read(cx).source().to_owned();
+                        if let Some(document) = &mut self.controller.document {
+                            let old_len = document.editor.source().len();
+                            let _ = document
+                                .editor
+                                .edit(tachylyte_markdown::Span::new(0, old_len), &source);
+                        }
+                    }
+                    tachylyte_editor_ui::EditorEvent::ModeChanged(mode) => {
+                        self.controller.set_mode(mode);
+                    }
+                    tachylyte_editor_ui::EditorEvent::SaveRequested => {
+                        self.controller.save();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(settings) = &self.settings_surface {
+            for event in settings.drain_events(cx) {
+                match event {
+                    tachylyte_settings_ui::SettingsEvent::ThemeChanged(theme) => {
+                        self.controller.settings.theme = match theme {
+                            tachylyte_settings_ui::Theme::Dark => Theme::Dark,
+                            tachylyte_settings_ui::Theme::Light
+                            | tachylyte_settings_ui::Theme::System => Theme::Light,
+                        };
+                        save_settings(&self.controller.settings);
+                    }
+                    tachylyte_settings_ui::SettingsEvent::PluginChanged { id, enabled } => {
+                        match id.as_str() {
+                            "file-explorer" => self.controller.settings.show_left_sidebar = enabled,
+                            "graph" => self.controller.settings.show_right_sidebar = enabled,
+                            "global-search" => {
+                                set_feature(&mut self.controller.settings, "Search", enabled)
+                            }
+                            "outline" => {
+                                set_feature(&mut self.controller.settings, "Outline", enabled)
+                            }
+                            "properties" => {
+                                set_feature(&mut self.controller.settings, "Properties", enabled)
+                            }
+                            "word-count" => {
+                                set_feature(&mut self.controller.settings, "Word count", enabled)
+                            }
+                            _ => {}
+                        }
+                        save_settings(&self.controller.settings);
+                    }
+                    tachylyte_settings_ui::SettingsEvent::CloseRequested => {
+                        self.settings_open = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(palette) = &self.command_palette {
+            for intent in palette.drain_intents(cx) {
+                if let tachylyte_workflow_ui::WorkflowIntent::RunCommand { command } = intent {
+                    if command == "quick-switcher" {
+                        self.quick_switcher_open = true;
+                        self.controller.palette_open = false;
+                    } else {
+                        self.controller.execute_command(&command);
+                    }
+                }
+            }
+        }
+        if let Some(switcher) = &self.quick_switcher {
+            for intent in switcher.drain_intents(cx) {
+                if let tachylyte_workflow_ui::WorkflowIntent::OpenPath { path } = intent {
+                    if let Ok(path) = VaultPath::new(path) {
+                        let _ = self.controller.select(&path);
+                        self.quick_switcher_open = false;
+                    }
+                }
+            }
         }
     }
 
@@ -998,6 +1213,16 @@ impl Shell {
         } else {
             self.controller.execute_command(command);
         }
+    }
+}
+
+fn set_feature(settings: &mut SettingsState, name: &str, enabled: bool) {
+    if let Some(feature) = settings
+        .features
+        .iter_mut()
+        .find(|feature| feature.name == name)
+    {
+        feature.enabled = enabled;
     }
 }
 #[cfg(any())]
@@ -1249,6 +1474,11 @@ impl Render for Shell {
                                                 shell.controller.save();
                                             } else if modified && key.eq_ignore_ascii_case("p") {
                                                 shell.controller.toggle_palette();
+                                            } else if modified && key.eq_ignore_ascii_case("o") {
+                                                shell.quick_switcher_open =
+                                                    !shell.quick_switcher_open;
+                                                shell.controller.palette_open =
+                                                    shell.quick_switcher_open;
                                             } else {
                                                 match key {
                                                     "backspace" => {
@@ -1327,6 +1557,14 @@ impl Render for Shell {
 
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_surface_events(cx);
+        self.ensure_surfaces(cx);
+        if let Some(palette) = &self.command_palette {
+            palette.sync_query(self.controller.query.clone(), cx);
+        }
+        if let Some(switcher) = &self.quick_switcher {
+            switcher.sync_query(self.controller.query.clone(), cx);
+        }
         let tokens = if self.controller.settings.theme == Theme::Light {
             tachylyte_theme::light()
         } else {
@@ -1346,18 +1584,17 @@ impl Render for Shell {
 
         let selected = self
             .controller
-            .document
+            .selected_path
             .as_ref()
-            .map(|document| document.path.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default();
+        let leaf_kind = self.controller.leaf_kind();
         let title = self
             .controller
-            .document
+            .selected_path
             .as_ref()
-            .map(|document| {
-                document
-                    .path
-                    .as_path()
+            .map(|path| {
+                path.as_path()
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("Untitled")
@@ -1376,14 +1613,6 @@ impl Render for Shell {
             .as_ref()
             .map(|document| document.mode)
             .unwrap_or(ViewMode::Source);
-        let note_paths = self
-            .controller
-            .entries
-            .iter()
-            .filter(|entry| entry.kind == FileKind::Markdown)
-            .map(|entry| entry.path.to_string())
-            .collect::<Vec<_>>();
-
         let collapse_entity = entity.clone();
         let new_note_entity = entity.clone();
         let new_folder_entity = entity.clone();
@@ -1394,6 +1623,9 @@ impl Render for Shell {
         let plus_entity = entity.clone();
         let help_entity = entity.clone();
         let settings_bottom_entity = entity.clone();
+        let graph_surface = self.graph.as_ref().map(GraphMount::entity);
+        let editor_surface = self.editor.as_ref().map(EditorSurface::entity);
+        let settings_surface = self.settings_surface.as_ref();
 
         let button = |id: &'static str, label: &'static str| {
             div()
@@ -1477,7 +1709,7 @@ impl Render for Shell {
                 move |_, _, cx| {
                     settings_entity.update(cx, |shell, cx| {
                         shell.controller.status = "Appearance settings".into();
-                        shell.controller.toggle_palette();
+                        shell.settings_open = true;
                         cx.notify();
                     });
                 },
@@ -1497,7 +1729,6 @@ impl Render for Shell {
             .controller
             .entries
             .iter()
-            .filter(|entry| entry.kind == FileKind::Markdown)
             .enumerate()
             .map(|(index, entry)| {
                 let path = entry.path.clone();
@@ -1649,19 +1880,37 @@ impl Render for Shell {
         } else {
             title.clone()
         };
-        let editor_body = match mode {
-            ViewMode::Source => div()
+        let editor_body = match leaf_kind {
+            LeafKind::Markdown => editor_surface
+                .map(|editor| editor.into_any_element())
+                .unwrap_or_else(|| {
+                    div()
+                        .child("Markdown editor unavailable")
+                        .into_any_element()
+                }),
+            LeafKind::Canvas => div()
+                .p_5()
                 .text_color(text)
-                .text_size(px(15.))
-                .child(source.clone()),
-            ViewMode::LivePreview => div()
+                .child("CANVAS LEAF")
+                .child("\nThis .canvas document is routed to the merged structured surface.")
+                .into_any_element(),
+            LeafKind::Bases => div()
+                .p_5()
                 .text_color(text)
-                .text_size(px(15.))
-                .child(format!("Live preview\n\n{source}")),
-            ViewMode::Reading => div()
+                .child("BASES LEAF")
+                .child("\nThis .base document is routed to the merged structured surface.")
+                .into_any_element(),
+            LeafKind::Media(kind) => div()
+                .p_5()
                 .text_color(text)
-                .text_size(px(16.))
-                .child(format!("Reading\n\n{source}")),
+                .child(format!("MEDIA LEAF · {kind:?}"))
+                .child(format!("\n{selected}"))
+                .into_any_element(),
+            LeafKind::Empty => div()
+                .p_5()
+                .text_color(text)
+                .child("Select a file from the explorer to open its routed leaf.")
+                .into_any_element(),
         };
         let editor_column = div()
             .flex_1()
@@ -1762,7 +2011,9 @@ impl Render for Shell {
                         .text_color(accent)
                         .child("GRAPH VIEW"),
                 )
-                .child(graph_scene(&note_paths, &selected))
+                .child(
+                    graph_surface.expect("graph surface is mounted before render"),
+                )
                 .child(div().flex_1())
                 .child(
                     div()
@@ -1814,7 +2065,7 @@ impl Render for Shell {
                             .text_color(accent)
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 settings_bottom_entity.update(cx, |shell, cx| {
-                                    shell.controller.toggle_palette();
+                                    shell.settings_open = true;
                                     cx.notify();
                                 });
                             })
@@ -1848,11 +2099,30 @@ impl Render for Shell {
                 .border_color(border)
                 .bg(tokens.modal_background())
                 .text_color(text)
-                .child("COMMAND PALETTE")
-                .child("\nType a command, or use the ribbon controls.")
-                .child(format!("\n{}", self.controller.query))
+                .child(if self.quick_switcher_open {
+                    self.quick_switcher
+                        .as_ref()
+                        .map(QuickSwitcherSurface::entity)
+                        .expect("quick switcher is mounted before render")
+                        .into_any_element()
+                } else {
+                    self.command_palette
+                        .as_ref()
+                        .map(CommandPaletteSurface::entity)
+                        .expect("command palette is mounted before render")
+                        .into_any_element()
+                })
+                .child("\nEnter runs the selected typed workflow intent.")
         } else {
             div()
+        };
+        let settings_overlay = if self.settings_open {
+            settings_surface
+                .map(SettingsSurface::modal)
+                .expect("settings surface is mounted before render")
+                .into_any_element()
+        } else {
+            div().into_any_element()
         };
 
         div()
@@ -1893,6 +2163,7 @@ impl Render for Shell {
             )
             .child(bottom)
             .child(palette_overlay)
+            .child(settings_overlay)
     }
 }
 
@@ -2054,9 +2325,27 @@ mod tests {
         assert!(c.save());
         assert_eq!(c.search(), vec!["note.md"]);
     }
+
+    #[test]
+    fn typed_non_markdown_files_route_to_explicit_leaves() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("board.canvas"), "{\"nodes\":[]}").unwrap();
+        fs::write(d.path().join("photo.png"), [0xff_u8, 0, 1, 2]).unwrap();
+        let mut c = AppController::new();
+        assert!(c.open_vault(d.path()));
+
+        assert!(c.select(&VaultPath::new("board.canvas").unwrap()));
+        assert_eq!(c.leaf_kind(), LeafKind::Canvas);
+        assert!(c.document.is_some());
+
+        assert!(c.select(&VaultPath::new("photo.png").unwrap()));
+        assert!(matches!(c.leaf_kind(), LeafKind::Media(FileKind::Image)));
+        assert!(c.document.is_none());
+    }
     #[test]
     fn palette_commands_and_feature_projection_are_deterministic() {
         let mut c = AppController::new();
+        c.settings = SettingsState::default();
         assert!(c.execute_command("sidebar.left"));
         assert!(!c.settings.show_left_sidebar);
         assert!(c.execute_command("mode.reading"));
