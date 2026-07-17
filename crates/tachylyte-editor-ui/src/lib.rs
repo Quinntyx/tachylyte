@@ -216,9 +216,9 @@ impl EditorState {
         if let Some((source, selection)) = self.history.pop() {
             self.redo_history
                 .push((self.source().to_owned(), self.selection));
-            self.document = EditorDocument::new(source);
-            self.selection = self.normalize(selection);
             self.revision = self.revision.saturating_add(1);
+            self.document = restore_document(source, self.revision);
+            self.selection = self.normalize(selection);
             self.events.push(EditorEvent::Changed {
                 revision: self.revision,
             });
@@ -228,9 +228,9 @@ impl EditorState {
         if let Some((source, selection)) = self.redo_history.pop() {
             self.history
                 .push((self.source().to_owned(), self.selection));
-            self.document = EditorDocument::new(source);
-            self.selection = self.normalize(selection);
             self.revision = self.revision.saturating_add(1);
+            self.document = restore_document(source, self.revision);
+            self.selection = self.normalize(selection);
             self.events.push(EditorEvent::Changed {
                 revision: self.revision,
             });
@@ -681,6 +681,18 @@ fn byte_to_utf16(s: &str, n: usize) -> usize {
 fn display_columns(s: &str) -> usize {
     s.graphemes(true).count()
 }
+fn restore_document(source: String, revision: u64) -> EditorDocument {
+    if revision == 0 {
+        return EditorDocument::new(source);
+    }
+    let mut document = EditorDocument::new(String::new());
+    let _ = document.edit(Span::new(0, 0), &source);
+    for _ in 1..revision {
+        let end = document.source().len();
+        let _ = document.edit(Span::new(end, end), "");
+    }
+    document
+}
 fn utf16_to_byte_range(s: &str, r: Range<usize>) -> Range<usize> {
     utf16_to_byte(s, r.start)..utf16_to_byte(s, r.end)
 }
@@ -790,7 +802,9 @@ mod tests {
         let edited = e.revision();
         e.undo();
         let undone = e.revision();
+        assert_eq!(e.document().revision, undone);
         e.redo();
+        assert_eq!(e.document().revision, e.revision());
         assert!(start < edited && edited < undone && undone < e.revision());
     }
 }
