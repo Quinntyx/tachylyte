@@ -2,11 +2,15 @@
 //! A small, testable GPUI shell for a local Markdown vault.
 
 use gpui::{
-    div, prelude::*, px, rgb, App, Application, Context, FocusHandle, KeyDownEvent,
-    Render, Size, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, App, Application, Context, FocusHandle, KeyDownEvent, Render, Size,
+    Window, WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
 use tachylyte_markdown::{EditorDocument, ViewMode};
@@ -522,7 +526,10 @@ impl From<&SettingsState> for PersistedSettings {
             features: settings
                 .features
                 .iter()
-                .map(|feature| PersistedFeature { name: feature.name.to_owned(), enabled: feature.enabled })
+                .map(|feature| PersistedFeature {
+                    name: feature.name.to_owned(),
+                    enabled: feature.enabled,
+                })
                 .collect(),
         }
     }
@@ -530,12 +537,18 @@ impl From<&SettingsState> for PersistedSettings {
 
 impl PersistedSettings {
     fn into_settings(self) -> SettingsState {
-        let mut settings = SettingsState::default();
-        settings.theme = self.theme;
-        settings.show_left_sidebar = self.show_left_sidebar;
-        settings.show_right_sidebar = self.show_right_sidebar;
+        let mut settings = SettingsState {
+            theme: self.theme,
+            show_left_sidebar: self.show_left_sidebar,
+            show_right_sidebar: self.show_right_sidebar,
+            ..SettingsState::default()
+        };
         for feature in self.features {
-            if let Some(current) = settings.features.iter_mut().find(|f| f.name == feature.name) {
+            if let Some(current) = settings
+                .features
+                .iter_mut()
+                .find(|f| f.name == feature.name)
+            {
                 current.enabled = feature.enabled;
             }
         }
@@ -550,10 +563,16 @@ fn recent_file() -> Option<PathBuf> {
 fn load_config() -> UserConfig {
     let settings = SettingsState::default();
     let Some(path) = recent_file() else {
-        return UserConfig { recent: Vec::new(), settings: Some((&settings).into()) };
+        return UserConfig {
+            recent: Vec::new(),
+            settings: Some((&settings).into()),
+        };
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return UserConfig { recent: Vec::new(), settings: Some((&settings).into()) };
+        return UserConfig {
+            recent: Vec::new(),
+            settings: Some((&settings).into()),
+        };
     };
     if let Ok(mut config) = serde_json::from_str::<UserConfig>(&contents) {
         config.settings.get_or_insert_with(|| (&settings).into());
@@ -561,18 +580,28 @@ fn load_config() -> UserConfig {
     }
     // Keep compatibility with the original format, which was just an array.
     let recent = serde_json::from_str::<Vec<RecentVault>>(&contents).unwrap_or_default();
-    UserConfig { recent, settings: Some((&settings).into()) }
+    UserConfig {
+        recent,
+        settings: Some((&settings).into()),
+    }
 }
 
 fn save_config(config: &UserConfig) {
     let Some(path) = recent_file() else { return };
-    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
-    if let Ok(json) = serde_json::to_string_pretty(config) { let _ = fs::write(path, json); }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let _ = fs::write(path, json);
+    }
 }
 
 /// Load persisted frame settings, falling back to the documented defaults.
 pub fn load_settings() -> SettingsState {
-    load_config().settings.expect("load_config always supplies settings").into_settings()
+    load_config()
+        .settings
+        .expect("load_config always supplies settings")
+        .into_settings()
 }
 
 /// Persist frame settings while retaining the recent-vault list.
@@ -594,7 +623,17 @@ fn save_recent(recent: &[RecentVault]) {
 
 fn remember_vault(path: &Path, recent: &mut Vec<RecentVault>) {
     recent.retain(|v| v.path != path);
-    recent.insert(0, RecentVault { path: path.to_path_buf(), name: path.file_name().and_then(|n| n.to_str()).unwrap_or("Vault").to_owned() });
+    recent.insert(
+        0,
+        RecentVault {
+            path: path.to_path_buf(),
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Vault")
+                .to_owned(),
+        },
+    );
     recent.truncate(8);
     save_recent(recent);
 }
@@ -611,7 +650,14 @@ pub struct Launcher {
 
 impl Launcher {
     fn new(cx: &mut Context<Self>) -> Self {
-        Self { recent: load_recent(), name_input: String::new(), path_input: String::new(), editing_name: false, message: String::new(), focus_handle: cx.focus_handle() }
+        Self {
+            recent: load_recent(),
+            name_input: String::new(),
+            path_input: String::new(),
+            editing_name: false,
+            message: String::new(),
+            focus_handle: cx.focus_handle(),
+        }
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -630,18 +676,27 @@ impl Launcher {
                 }
                 Err(error) => self.message = format!("Could not open workspace: {error}"),
             }
-        } else { self.message = controller.status; }
+        } else {
+            self.message = controller.status;
+        }
         cx.notify();
     }
 
     fn create_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.name_input.trim();
         let parent = self.path_input.trim();
-        if name.is_empty() || parent.is_empty() { self.message = "Enter a vault name and parent folder.".into(); cx.notify(); return; }
+        if name.is_empty() || parent.is_empty() {
+            self.message = "Enter a vault name and parent folder.".into();
+            cx.notify();
+            return;
+        }
         let path = Path::new(parent).join(name);
         match fs::create_dir_all(&path) {
             Ok(()) => self.open_path(path, window, cx),
-            Err(e) => { self.message = format!("Could not create vault: {e}"); cx.notify(); }
+            Err(e) => {
+                self.message = format!("Could not create vault: {e}");
+                cx.notify();
+            }
         }
     }
 }
@@ -651,28 +706,255 @@ impl Render for Launcher {
         let entity = cx.entity();
         let recent = self.recent.clone();
         let cards = recent.into_iter().enumerate().map(|(i, vault)| {
-            let open_entity = entity.clone(); let remove_entity = entity.clone();
-            let path = vault.path.clone(); let remove_path = path.clone(); let reveal_path = path.clone();
+            let open_entity = entity.clone();
+            let remove_entity = entity.clone();
+            let path = vault.path.clone();
+            let remove_path = path.clone();
+            let reveal_path = path.clone();
             let stale = !path.is_dir();
-            div().flex().items_center().gap_2().p_2().border_1().border_color(rgb(0xe0e0e0))
-                .child(div().flex_1().child(format!("{}\n{}{}", vault.name, path.display(), if stale { "  · unavailable" } else { "" })))
-                .child(div().id(("recent-open", i)).px_2().py_1().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| open_entity.update(c, |l, c| l.open_path(path.clone(), w, c))).child("Open"))
-                .child(div().id(("recent-reveal", i)).px_2().py_1().on_mouse_down(gpui::MouseButton::Left, move |_, _, _| { let _ = Command::new("xdg-open").arg(reveal_path.clone()).spawn(); }).child("Reveal"))
-                .child(div().id(("recent-remove", i)).px_2().py_1().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| remove_entity.update(c, |l, c| { l.recent.retain(|v| v.path != remove_path); save_recent(&l.recent); c.notify(); })).child("Remove"))
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .p_2()
+                .border_1()
+                .border_color(rgb(0xe0e0e0))
+                .child(div().flex_1().child(format!(
+                    "{}\n{}{}",
+                    vault.name,
+                    path.display(),
+                    if stale { "  · unavailable" } else { "" }
+                )))
+                .child(
+                    div()
+                        .id(("recent-open", i))
+                        .px_2()
+                        .py_1()
+                        .bg(rgb(0x7852ee))
+                        .text_color(rgb(0xffffff))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, w, c| {
+                            open_entity.update(c, |l, c| l.open_path(path.clone(), w, c))
+                        })
+                        .child("Open"),
+                )
+                .child(
+                    div()
+                        .id(("recent-reveal", i))
+                        .px_2()
+                        .py_1()
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, _, _| {
+                            let _ = Command::new("xdg-open").arg(reveal_path.clone()).spawn();
+                        })
+                        .child("Reveal"),
+                )
+                .child(
+                    div()
+                        .id(("recent-remove", i))
+                        .px_2()
+                        .py_1()
+                        .on_mouse_down(gpui::MouseButton::Left, move |_, _, c| {
+                            remove_entity.update(c, |l, c| {
+                                l.recent.retain(|v| v.path != remove_path);
+                                save_recent(&l.recent);
+                                c.notify();
+                            })
+                        })
+                        .child("Remove"),
+                )
         });
-        let create_entity = entity.clone(); let pick_entity = entity.clone(); let open_entity = entity.clone();
-        let name_entity = entity.clone(); let path_entity = entity.clone();
-        let name_border = if self.editing_name { 0x7852ee } else { 0xe0e0e0 };
-        let path_border = if self.editing_name { 0xe0e0e0 } else { 0x7852ee };
-        div().size_full().bg(rgb(0xffffff)).text_color(rgb(0x222222)).flex().flex_col().items_center().p_8()
-            .child(div().text_xl().child("◈  TACHYLYTE")).child(div().text_sm().text_color(rgb(0x5c5c5c)).child("Your notes, your space."))
-            .child(div().mt_6().w(px(620.)).child("Recent vaults")).child(div().w(px(620.)).flex().flex_col().gap_2().mt_2().children(cards))
-            .child(div().w(px(620.)).mt_5().flex().gap_2().items_center().child("Create new vault").child(div().flex_1().border_1().border_color(rgb(name_border)).p_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| name_entity.update(c, |l, c| { l.editing_name = true; c.notify(); })).child(if self.name_input.is_empty() { "Vault name".to_owned() } else { self.name_input.clone() })).child(div().id("create-vault").px_3().py_2().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| create_entity.update(c, |l, c| l.create_vault(w, c))).child("Create")))
-            .child(div().w(px(620.)).mt_2().flex().gap_2().items_center().child("Parent folder").child(div().flex_1().border_1().border_color(rgb(path_border)).p_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| path_entity.update(c, |l, c| { l.editing_name = false; c.notify(); })).child(if self.path_input.is_empty() { "Type a path or browse".to_owned() } else { self.path_input.clone() })).child(div().id("pick-folder").px_3().py_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| { if let Some(path) = rfd::FileDialog::new().set_title("Choose vault parent folder").pick_folder() { pick_entity.update(c, |l, c| { l.path_input = path.display().to_string(); l.editing_name = false; c.notify(); }); } }).child("Browse")))
-            .child(div().w(px(620.)).mt_2().flex().gap_2().items_center().child("Open folder as vault").child(div().flex_1().border_1().border_color(rgb(if self.editing_name { 0xe0e0e0 } else { 0x7852ee })).p_2().child(if self.path_input.is_empty() { "Type a path or browse".to_owned() } else { self.path_input.clone() })).child(div().id("open-folder").px_3().py_2().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| open_entity.update(c, |l, c| l.open_path(PathBuf::from(l.path_input.trim()), w, c))).child("Open")))
-            .child(div().mt_4().text_color(rgb(0x5c5c5c)).child(self.message.clone())).child(div().flex_1())
-            .child(div().text_sm().text_color(rgb(0x5c5c5c)).child("Help  ·  English  ·  Manage your vaults locally"))
-            .track_focus(&self.focus_handle).on_key_down(cx.listener(|launcher, event: &KeyDownEvent, _, cx| { let input = if launcher.editing_name { &mut launcher.name_input } else { &mut launcher.path_input }; if event.keystroke.key.as_str() == "backspace" { input.pop(); } else if let Some(ch) = &event.keystroke.key_char { if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform { input.push_str(ch); } } cx.notify(); }))
+        let create_entity = entity.clone();
+        let pick_entity = entity.clone();
+        let open_entity = entity.clone();
+        let name_entity = entity.clone();
+        let path_entity = entity.clone();
+        let name_border = if self.editing_name {
+            0x7852ee
+        } else {
+            0xe0e0e0
+        };
+        let path_border = if self.editing_name {
+            0xe0e0e0
+        } else {
+            0x7852ee
+        };
+        div()
+            .size_full()
+            .bg(rgb(0xffffff))
+            .text_color(rgb(0x222222))
+            .flex()
+            .flex_col()
+            .items_center()
+            .p_8()
+            .child(div().text_xl().child("◈  TACHYLYTE"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x5c5c5c))
+                    .child("Your notes, your space."),
+            )
+            .child(div().mt_6().w(px(620.)).child("Recent vaults"))
+            .child(
+                div()
+                    .w(px(620.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .mt_2()
+                    .children(cards),
+            )
+            .child(
+                div()
+                    .w(px(620.))
+                    .mt_5()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child("Create new vault")
+                    .child(
+                        div()
+                            .flex_1()
+                            .border_1()
+                            .border_color(rgb(name_border))
+                            .p_2()
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, c| {
+                                name_entity.update(c, |l, c| {
+                                    l.editing_name = true;
+                                    c.notify();
+                                })
+                            })
+                            .child(if self.name_input.is_empty() {
+                                "Vault name".to_owned()
+                            } else {
+                                self.name_input.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("create-vault")
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x7852ee))
+                            .text_color(rgb(0xffffff))
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, w, c| {
+                                create_entity.update(c, |l, c| l.create_vault(w, c))
+                            })
+                            .child("Create"),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(620.))
+                    .mt_2()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child("Parent folder")
+                    .child(
+                        div()
+                            .flex_1()
+                            .border_1()
+                            .border_color(rgb(path_border))
+                            .p_2()
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, c| {
+                                path_entity.update(c, |l, c| {
+                                    l.editing_name = false;
+                                    c.notify();
+                                })
+                            })
+                            .child(if self.path_input.is_empty() {
+                                "Type a path or browse".to_owned()
+                            } else {
+                                self.path_input.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("pick-folder")
+                            .px_3()
+                            .py_2()
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, c| {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_title("Choose vault parent folder")
+                                    .pick_folder()
+                                {
+                                    pick_entity.update(c, |l, c| {
+                                        l.path_input = path.display().to_string();
+                                        l.editing_name = false;
+                                        c.notify();
+                                    });
+                                }
+                            })
+                            .child("Browse"),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(620.))
+                    .mt_2()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child("Open folder as vault")
+                    .child(
+                        div()
+                            .flex_1()
+                            .border_1()
+                            .border_color(rgb(if self.editing_name {
+                                0xe0e0e0
+                            } else {
+                                0x7852ee
+                            }))
+                            .p_2()
+                            .child(if self.path_input.is_empty() {
+                                "Type a path or browse".to_owned()
+                            } else {
+                                self.path_input.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("open-folder")
+                            .px_3()
+                            .py_2()
+                            .bg(rgb(0x7852ee))
+                            .text_color(rgb(0xffffff))
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, w, c| {
+                                open_entity.update(c, |l, c| {
+                                    l.open_path(PathBuf::from(l.path_input.trim()), w, c)
+                                })
+                            })
+                            .child("Open"),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .text_color(rgb(0x5c5c5c))
+                    .child(self.message.clone()),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x5c5c5c))
+                    .child("Help  ·  English  ·  Manage your vaults locally"),
+            )
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|launcher, event: &KeyDownEvent, _, cx| {
+                let input = if launcher.editing_name {
+                    &mut launcher.name_input
+                } else {
+                    &mut launcher.path_input
+                };
+                if event.keystroke.key.as_str() == "backspace" {
+                    input.pop();
+                } else if let Some(ch) = &event.keystroke.key_char {
+                    if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform {
+                        input.push_str(ch);
+                    }
+                }
+                cx.notify();
+            }))
     }
 }
 
@@ -695,7 +977,10 @@ impl Shell {
     fn open_vault_manager(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(
-                Size { width: px(800.), height: px(600.) },
+                Size {
+                    width: px(800.),
+                    height: px(600.),
+                },
                 cx,
             )),
             ..WindowOptions::default()
@@ -1022,7 +1307,18 @@ impl Render for Shell {
                     .h(px(26.))
                     .px_3()
                     .bg(rgb(panel))
-                    .child(div().id("manage-vaults").text_color(rgb(0x7852ee)).on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| manage_entity.update(cx, |shell, cx| { shell.execute_command("manage vaults", window, cx); cx.notify(); })).child("Manage vaults"))
+                    .child(
+                        div()
+                            .id("manage-vaults")
+                            .text_color(rgb(0x7852ee))
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                manage_entity.update(cx, |shell, cx| {
+                                    shell.execute_command("manage vaults", window, cx);
+                                    cx.notify();
+                                })
+                            })
+                            .child("Manage vaults"),
+                    )
                     .child("  ·  Ready  ·  Ctrl/Cmd+P palette  ·  Ctrl/Cmd+S save"),
             )
             .child(palette)
@@ -1141,73 +1437,61 @@ impl Render for Shell {
                     })
                     .child("‹"),
             )
-            .child(
-                button("ribbon-search", "⌕").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|shell, _, _, cx| {
+            .child(button("ribbon-search", "⌕").on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|shell, _, _, cx| {
+                    shell.controller.toggle_palette();
+                    cx.notify();
+                }),
+            ))
+            .child(button("ribbon-new-note", "+").on_mouse_down(
+                gpui::MouseButton::Left,
+                move |_, _, cx| {
+                    new_note_entity.update(cx, |shell, cx| {
+                        shell.controller.create_note();
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(button("ribbon-new-folder", "▱").on_mouse_down(
+                gpui::MouseButton::Left,
+                move |_, _, cx| {
+                    new_folder_entity.update(cx, |shell, cx| {
+                        shell.controller.create_folder();
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(button("ribbon-graph", "⌘").on_mouse_down(
+                gpui::MouseButton::Left,
+                move |_, _, cx| {
+                    graph_entity.update(cx, |shell, cx| {
+                        shell.controller.settings.toggle_right_sidebar();
+                        save_settings(&shell.controller.settings);
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(button("ribbon-settings", "⚙").on_mouse_down(
+                gpui::MouseButton::Left,
+                move |_, _, cx| {
+                    settings_entity.update(cx, |shell, cx| {
+                        shell.controller.status = "Appearance settings".into();
                         shell.controller.toggle_palette();
                         cx.notify();
-                    }),
-                ),
-            )
-            .child(
-                button("ribbon-new-note", "+").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_, _, cx| {
-                        new_note_entity.update(cx, |shell, cx| {
-                            shell.controller.create_note();
-                            cx.notify();
-                        });
-                    },
-                ),
-            )
-            .child(
-                button("ribbon-new-folder", "▱").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_, _, cx| {
-                        new_folder_entity.update(cx, |shell, cx| {
-                            shell.controller.create_folder();
-                            cx.notify();
-                        });
-                    },
-                ),
-            )
-            .child(
-                button("ribbon-graph", "⌘").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_, _, cx| {
-                        graph_entity.update(cx, |shell, cx| {
-                            shell.controller.settings.toggle_right_sidebar();
-                            save_settings(&shell.controller.settings);
-                            cx.notify();
-                        });
-                    },
-                ),
-            )
-            .child(
-                button("ribbon-settings", "⚙").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_, _, cx| {
-                        settings_entity.update(cx, |shell, cx| {
-                            shell.controller.status = "Appearance settings".into();
-                            shell.controller.toggle_palette();
-                            cx.notify();
-                        });
-                    },
-                ),
-            )
+                    });
+                },
+            ))
             .child(div().flex_1())
-            .child(
-                button("ribbon-help", "?").on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |_, _, cx| {
-                        help_entity.update(cx, |shell, cx| {
-                            shell.controller.status = "Help: Ctrl/Cmd+P for commands".into();
-                            cx.notify();
-                        });
-                    },
-                ),
-            );
+            .child(button("ribbon-help", "?").on_mouse_down(
+                gpui::MouseButton::Left,
+                move |_, _, cx| {
+                    help_entity.update(cx, |shell, cx| {
+                        shell.controller.status = "Help: Ctrl/Cmd+P for commands".into();
+                        cx.notify();
+                    });
+                },
+            ));
 
         let rows = self
             .controller
@@ -1261,13 +1545,7 @@ impl Render for Shell {
                         .text_size(px(11.))
                         .text_color(muted)
                         .child("VAULT")
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child("⌕")
-                                .child("•••"),
-                        ),
+                        .child(div().flex().gap_2().child("⌕").child("•••")),
                 )
                 .child(
                     div()
@@ -1432,8 +1710,8 @@ impl Render for Shell {
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
-                        let modified = event.keystroke.modifiers.control
-                            || event.keystroke.modifiers.platform;
+                        let modified =
+                            event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
                         if modified && key.eq_ignore_ascii_case("s") {
                             shell.controller.save();
                             window.prevent_default();
@@ -1494,7 +1772,10 @@ impl Render for Shell {
                         .text_size(px(12.))
                         .text_color(muted)
                         .child("Backlinks")
-                        .child(format!("\n{} incoming links", self.controller.details().map_or(0, |d| d.2))),
+                        .child(format!(
+                            "\n{} incoming links",
+                            self.controller.details().map_or(0, |d| d.2)
+                        )),
                 )
         } else {
             div().w(px(0.))
@@ -1551,7 +1832,10 @@ impl Render for Shell {
                             .child("Manage vaults"),
                     ),
             )
-            .child(format!("{status}   ·   {word_count} words   ·   {} characters", source.chars().count()));
+            .child(format!(
+                "{status}   ·   {word_count} words   ·   {} characters",
+                source.chars().count()
+            ));
 
         let palette_overlay = if self.controller.palette_open {
             div()
@@ -1623,11 +1907,19 @@ pub fn open_workspace_window(cx: &mut App, mut controller: AppController) -> gpu
         controller.ensure_welcome();
     }
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(Size { width: px(1280.), height: px(800.) }, cx)),
+        window_bounds: Some(WindowBounds::centered(
+            Size {
+                width: px(1280.),
+                height: px(800.),
+            },
+            cx,
+        )),
         ..WindowOptions::default()
     };
-    cx.open_window(options, move |_window, cx| cx.new(|cx| Shell::with_controller(controller, cx)))
-        .map(|_| ())
+    cx.open_window(options, move |_window, cx| {
+        cx.new(|cx| Shell::with_controller(controller, cx))
+    })
+    .map(|_| ())
 }
 
 /// Open the desktop workspace window.
@@ -1639,10 +1931,17 @@ pub fn open_shell_window(cx: &mut App) -> gpui::Result<()> {
 /// Open the launcher window used by the vault manager.
 pub fn open_launcher_window(cx: &mut App) -> gpui::Result<()> {
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(Size { width: px(800.), height: px(600.) }, cx)),
+        window_bounds: Some(WindowBounds::centered(
+            Size {
+                width: px(800.),
+                height: px(600.),
+            },
+            cx,
+        )),
         ..WindowOptions::default()
     };
-    cx.open_window(options, |_window, cx| cx.new(Launcher::new)).map(|_| ())
+    cx.open_window(options, |_window, cx| cx.new(Launcher::new))
+        .map(|_| ())
 }
 /// Start the native GPUI application.
 pub fn launch() {
@@ -1707,11 +2006,9 @@ mod tests {
                 .map(|document| document.path.to_string()),
             Some("Welcome.md".into())
         );
-        assert!(
-            fs::read_to_string(d.path().join("Welcome.md"))
-                .unwrap()
-                .contains("Welcome to Tachylyte")
-        );
+        assert!(fs::read_to_string(d.path().join("Welcome.md"))
+            .unwrap()
+            .contains("Welcome to Tachylyte"));
     }
 
     #[test]

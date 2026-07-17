@@ -36,7 +36,11 @@ impl AppController {
         };
         let root = vault.root().to_path_buf();
         for n in 0.. {
-            let name = if n == 0 { "Untitled.md".into() } else { format!("Untitled {n}.md") };
+            let name = if n == 0 {
+                "Untitled.md".into()
+            } else {
+                format!("Untitled {n}.md")
+            };
             let path = VaultPath::new(name).expect("generated note path is valid");
             if vault.create(&path, b"# Untitled\n\n").is_ok() {
                 self.open_vault(&root);
@@ -54,8 +58,13 @@ impl AppController {
         };
         let root = vault.root().to_path_buf();
         for n in 0.. {
-            let folder = if n == 0 { "New folder".into() } else { format!("New folder {n}") };
-            let path = VaultPath::new(PathBuf::from(&folder).join(".keep.md")).expect("generated folder path is valid");
+            let folder = if n == 0 {
+                "New folder".into()
+            } else {
+                format!("New folder {n}")
+            };
+            let path = VaultPath::new(PathBuf::from(&folder).join(".keep.md"))
+                .expect("generated folder path is valid");
             if vault.create(&path, b"# Folder\n").is_ok() {
                 self.open_vault(&root);
                 return true;
@@ -70,7 +79,12 @@ impl AppController {
             self.status = "Open a vault first".into();
             return false;
         }
-        let Some(existing) = self.entries.iter().find(|e| e.kind == FileKind::Markdown).map(|e| e.path.clone()) else {
+        let Some(existing) = self
+            .entries
+            .iter()
+            .find(|e| e.kind == FileKind::Markdown)
+            .map(|e| e.path.clone())
+        else {
             let vault = self.vault.as_ref().expect("checked above");
             let root = vault.root().to_path_buf();
             let path = VaultPath::new("Welcome.md").expect("literal welcome path is valid");
