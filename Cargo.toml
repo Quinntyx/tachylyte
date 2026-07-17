@@ -17,3 +17,5 @@ serde_json = "1"
 tachylyte-core = { path = "crates/tachylyte-core" }
 tachylyte-knowledge = { path = "crates/tachylyte-knowledge" }
 tachylyte-markdown = { path = "crates/tachylyte-markdown" }
+tachylyte-workflows = { path = "crates/tachylyte-workflows" }
+tachylyte-workflow-ui = { path = "crates/tachylyte-workflow-ui" }

@@ -5471,12 +5471,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-theme"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tachylyte-vaults"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "tachylyte-workflow-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "tachylyte-knowledge",
+ "tachylyte-workflows",
 ]
 
 [[package]]
