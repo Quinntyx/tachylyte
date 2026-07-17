@@ -9,6 +9,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 gpui = "=0.2.2"
+tachylyte-theme = { path = "crates/tachylyte-theme" }
 dirs = "5"
 rfd = { version = "0.17.2", default-features = true }
 serde = { version = "1", features = ["derive"] }
