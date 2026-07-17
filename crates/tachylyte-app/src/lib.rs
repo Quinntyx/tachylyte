@@ -11,6 +11,13 @@ use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
 use tachylyte_markdown::{EditorDocument, ViewMode};
 
+mod graph_view;
+mod theme_helpers;
+mod workspace_actions;
+
+use graph_view::graph_scene;
+use theme_helpers::UiPalette;
+
 /// The visual palette used by the shell.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub enum Theme {
@@ -695,6 +702,7 @@ impl Shell {
     }
 
     /// Execute a workspace command, including commands that open another window.
+    #[allow(dead_code)]
     fn execute_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         if command.trim().eq_ignore_ascii_case("manage vaults")
             || command.trim().eq_ignore_ascii_case("vaults")
@@ -705,6 +713,7 @@ impl Shell {
         }
     }
 }
+#[cfg(any())]
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let light = self.controller.settings.theme == Theme::Light;
@@ -1018,8 +1027,600 @@ impl Render for Shell {
     }
 }
 
+impl Render for Shell {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = if self.controller.settings.theme == Theme::Light {
+            tachylyte_theme::light()
+        } else {
+            tachylyte_theme::dark()
+        };
+        let palette = UiPalette::light();
+        let app = tokens.app();
+        let panel = tokens.panel();
+        let editor = tokens.structured();
+        let text = tokens.text();
+        let muted = tokens.muted_text();
+        let border = tokens.border();
+        let accent = tokens.accent();
+        let yellow = tokens.yellow();
+        let selected_surface = tokens.selected();
+        let entity = cx.entity();
+
+        let selected = self
+            .controller
+            .document
+            .as_ref()
+            .map(|document| document.path.to_string())
+            .unwrap_or_default();
+        let title = self
+            .controller
+            .document
+            .as_ref()
+            .map(|document| {
+                document
+                    .path
+                    .as_path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Untitled")
+                    .to_owned()
+            })
+            .unwrap_or_else(|| "No note open".into());
+        let source = self
+            .controller
+            .document
+            .as_ref()
+            .map(|document| document.editor.source().to_owned())
+            .unwrap_or_else(|| "Select a note from the explorer to begin.".into());
+        let mode = self
+            .controller
+            .document
+            .as_ref()
+            .map(|document| document.mode)
+            .unwrap_or(ViewMode::Source);
+        let note_paths = self
+            .controller
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::Markdown)
+            .map(|entry| entry.path.to_string())
+            .collect::<Vec<_>>();
+
+        let collapse_entity = entity.clone();
+        let new_note_entity = entity.clone();
+        let new_folder_entity = entity.clone();
+        let graph_entity = entity.clone();
+        let settings_entity = entity.clone();
+        let manage_entity = entity.clone();
+        let close_entity = entity.clone();
+        let plus_entity = entity.clone();
+        let help_entity = entity.clone();
+        let settings_bottom_entity = entity.clone();
+
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .w_full()
+                .h(px(34.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(muted)
+                .text_size(px(16.))
+                .hover(|style| style.bg(tokens.hover()))
+                .child(label)
+        };
+
+        let ribbon = div()
+            .w(px(40.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .border_1()
+            .border_color(border)
+            .bg(panel)
+            .child(
+                div()
+                    .id("collapse-sidebar")
+                    .w_full()
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(text)
+                    .hover(|style| style.bg(tokens.hover()))
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        collapse_entity.update(cx, |shell, cx| {
+                            shell.controller.settings.toggle_left_sidebar();
+                            save_settings(&shell.controller.settings);
+                            cx.notify();
+                        });
+                    })
+                    .child("‹"),
+            )
+            .child(
+                button("ribbon-search", "⌕").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|shell, _, _, cx| {
+                        shell.controller.toggle_palette();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                button("ribbon-new-note", "+").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    move |_, _, cx| {
+                        new_note_entity.update(cx, |shell, cx| {
+                            shell.controller.create_note();
+                            cx.notify();
+                        });
+                    },
+                ),
+            )
+            .child(
+                button("ribbon-new-folder", "▱").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    move |_, _, cx| {
+                        new_folder_entity.update(cx, |shell, cx| {
+                            shell.controller.create_folder();
+                            cx.notify();
+                        });
+                    },
+                ),
+            )
+            .child(
+                button("ribbon-graph", "⌘").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    move |_, _, cx| {
+                        graph_entity.update(cx, |shell, cx| {
+                            shell.controller.settings.toggle_right_sidebar();
+                            save_settings(&shell.controller.settings);
+                            cx.notify();
+                        });
+                    },
+                ),
+            )
+            .child(
+                button("ribbon-settings", "⚙").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    move |_, _, cx| {
+                        settings_entity.update(cx, |shell, cx| {
+                            shell.controller.status = "Appearance settings".into();
+                            shell.controller.toggle_palette();
+                            cx.notify();
+                        });
+                    },
+                ),
+            )
+            .child(div().flex_1())
+            .child(
+                button("ribbon-help", "?").on_mouse_down(
+                    gpui::MouseButton::Left,
+                    move |_, _, cx| {
+                        help_entity.update(cx, |shell, cx| {
+                            shell.controller.status = "Help: Ctrl/Cmd+P for commands".into();
+                            cx.notify();
+                        });
+                    },
+                ),
+            );
+
+        let rows = self
+            .controller
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::Markdown)
+            .enumerate()
+            .map(|(index, entry)| {
+                let path = entry.path.clone();
+                let label = entry.path.to_string();
+                let is_selected = label == selected;
+                let row_entity = entity.clone();
+                div()
+                    .id(("explorer-file", index))
+                    .w_full()
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .text_color(if is_selected { text } else { muted })
+                    .bg(if is_selected { selected_surface } else { panel })
+                    .hover(|style| style.bg(tokens.hover()))
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        row_entity.update(cx, |shell, cx| {
+                            shell.controller.select(&path);
+                            cx.notify();
+                        });
+                    })
+                    .child(format!("▱  {label}"))
+            });
+
+        let explorer = if self.controller.settings.show_left_sidebar
+            && self.controller.settings.feature_enabled("File explorer")
+        {
+            div()
+                .w(px(295.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(border)
+                .bg(panel)
+                .child(
+                    div()
+                        .h(px(44.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("VAULT")
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child("⌕")
+                                .child("•••"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child("FILES"),
+                )
+                .children(rows)
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .h(px(42.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_1()
+                        .border_color(border)
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("⌄  Vault files")
+                        .child("↗"),
+                )
+        } else {
+            div().w(px(0.))
+        };
+
+        let mode_button = |label: &'static str, button_mode: ViewMode| {
+            let mode_entity = entity.clone();
+            let active = mode == button_mode;
+            div()
+                .id(label)
+                .px_2()
+                .py_1()
+                .text_size(px(11.))
+                .text_color(if active { accent } else { muted })
+                .bg(if active { selected_surface } else { editor })
+                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                    mode_entity.update(cx, |shell, cx| {
+                        shell.controller.set_mode(button_mode);
+                        cx.notify();
+                    });
+                })
+                .child(label)
+        };
+
+        let close_title = close_entity.clone();
+        let tab_strip = div()
+            .h(px(38.))
+            .flex()
+            .items_center()
+            .border_1()
+            .border_color(border)
+            .bg(panel)
+            .child(
+                div()
+                    .h_full()
+                    .min_w(px(180.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .border_1()
+                    .border_color(border)
+                    .bg(editor)
+                    .text_color(text)
+                    .text_size(px(13.))
+                    .child(format!("▱  {title}")),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("close-note-tab")
+                    .px_3()
+                    .text_color(muted)
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        close_title.update(cx, |shell, cx| {
+                            shell.controller.document = None;
+                            shell.controller.status = "Tab closed".into();
+                            cx.notify();
+                        });
+                    })
+                    .child("×"),
+            )
+            .child(
+                div()
+                    .id("new-note-tab")
+                    .px_3()
+                    .text_color(accent)
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        plus_entity.update(cx, |shell, cx| {
+                            shell.controller.create_note();
+                            cx.notify();
+                        });
+                    })
+                    .child("+"),
+            );
+
+        let heading = if selected.is_empty() {
+            "Welcome to your workspace".to_owned()
+        } else {
+            title.clone()
+        };
+        let editor_body = match mode {
+            ViewMode::Source => div()
+                .text_color(text)
+                .text_size(px(15.))
+                .child(source.clone()),
+            ViewMode::LivePreview => div()
+                .text_color(text)
+                .text_size(px(15.))
+                .child(format!("Live preview\n\n{source}")),
+            ViewMode::Reading => div()
+                .text_color(text)
+                .text_size(px(16.))
+                .child(format!("Reading\n\n{source}")),
+        };
+        let editor_column = div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(editor)
+            .child(tab_strip)
+            .child(
+                div()
+                    .h(px(46.))
+                    .px_5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_1()
+                    .border_color(border)
+                    .text_color(muted)
+                    .text_size(px(12.))
+                    .child("‹  ›   ⌂  /  Notes")
+                    .child("⋮"),
+            )
+            .child(
+                div()
+                    .px_5()
+                    .pt_4()
+                    .text_color(text)
+                    .text_size(px(24.))
+                    .child(heading),
+            )
+            .child(
+                div()
+                    .px_5()
+                    .pt_3()
+                    .flex()
+                    .gap_1()
+                    .child(mode_button("Source", ViewMode::Source))
+                    .child(mode_button("Live Preview", ViewMode::LivePreview))
+                    .child(mode_button("Reading", ViewMode::Reading)),
+            )
+            .child(
+                div()
+                    .id("editor-leaf")
+                    .flex_1()
+                    .p_5()
+                    .track_focus(&self.focus_handle)
+                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                        let key = event.keystroke.key.as_str();
+                        let modified = event.keystroke.modifiers.control
+                            || event.keystroke.modifiers.platform;
+                        if modified && key.eq_ignore_ascii_case("s") {
+                            shell.controller.save();
+                            window.prevent_default();
+                        } else if key == "backspace" {
+                            shell.controller.backspace();
+                        } else if key == "enter" {
+                            shell.controller.newline();
+                        } else if let Some(character) = &event.keystroke.key_char {
+                            if !modified && !event.keystroke.modifiers.alt {
+                                shell.controller.insert_text(character);
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child(editor_body),
+            );
+
+        let right = if self.controller.settings.show_right_sidebar {
+            div()
+                .w(px(340.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .border_1()
+                .border_color(border)
+                .bg(panel)
+                .child(
+                    div()
+                        .h(px(38.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_1()
+                        .border_color(border)
+                        .text_size(px(12.))
+                        .text_color(text)
+                        .child("Graph")
+                        .child("×"),
+                )
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.))
+                        .text_color(accent)
+                        .child("GRAPH VIEW"),
+                )
+                .child(graph_scene(&note_paths, &selected))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .p_3()
+                        .border_1()
+                        .border_color(border)
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("Backlinks")
+                        .child(format!("\n{} incoming links", self.controller.details().map_or(0, |d| d.2))),
+                )
+        } else {
+            div().w(px(0.))
+        };
+
+        let vault_name = self
+            .controller
+            .vault
+            .as_ref()
+            .and_then(|vault| vault.root().file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("No vault")
+            .to_owned();
+        let word_count = self.controller.details().map_or(0, |details| details.3);
+        let status = self.controller.status.clone();
+        let bottom = div()
+            .h(px(28.))
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .border_1()
+            .border_color(border)
+            .bg(panel)
+            .text_size(px(11.))
+            .text_color(muted)
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(vault_name)
+                    .child("Help")
+                    .child(
+                        div()
+                            .id("bottom-settings")
+                            .text_color(accent)
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                settings_bottom_entity.update(cx, |shell, cx| {
+                                    shell.controller.toggle_palette();
+                                    cx.notify();
+                                });
+                            })
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .id("bottom-manage-vaults")
+                            .text_color(accent)
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                                manage_entity.update(cx, |shell, cx| {
+                                    shell.open_vault_manager(window, cx);
+                                });
+                            })
+                            .child("Manage vaults"),
+                    ),
+            )
+            .child(format!("{status}   ·   {word_count} words   ·   {} characters", source.chars().count()));
+
+        let palette_overlay = if self.controller.palette_open {
+            div()
+                .absolute()
+                .top(px(52.))
+                .left(px(340.))
+                .w(px(420.))
+                .p_4()
+                .border_1()
+                .border_color(border)
+                .bg(tokens.modal_background())
+                .text_color(text)
+                .child("COMMAND PALETTE")
+                .child("\nType a command, or use the ribbon controls.")
+                .child(format!("\n{}", self.controller.query))
+        } else {
+            div()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(if self.controller.settings.theme == Theme::Light {
+                palette.app
+            } else {
+                app
+            })
+            .text_color(text)
+            .child(div().h(px(2.)).bg(yellow))
+            .child(
+                div()
+                    .h(px(42.))
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel)
+                    .text_color(text)
+                    .child("◈  TACHYLYTE")
+                    .child(div().flex_1())
+                    .child("⌘P")
+                    .child("  ·  ")
+                    .child("□"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .child(ribbon)
+                    .child(explorer)
+                    .child(editor_column)
+                    .child(right),
+            )
+            .child(bottom)
+            .child(palette_overlay)
+    }
+}
+
 /// Open the normal workspace window with a controller that has a valid vault.
-pub fn open_workspace_window(cx: &mut App, controller: AppController) -> gpui::Result<()> {
+pub fn open_workspace_window(cx: &mut App, mut controller: AppController) -> gpui::Result<()> {
+    if controller.vault.is_some()
+        && !controller
+            .entries
+            .iter()
+            .any(|entry| entry.kind == FileKind::Markdown)
+    {
+        controller.ensure_welcome();
+    }
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(Size { width: px(1280.), height: px(800.) }, cx)),
         ..WindowOptions::default()
@@ -1093,6 +1694,25 @@ mod tests {
         assert!(!c.open_vault(&d.path().join("missing")));
         assert!(c.status.contains("Unable"));
     }
+    #[test]
+    fn empty_vault_seeds_and_opens_welcome() {
+        let d = tempdir().unwrap();
+        let mut c = AppController::new();
+        assert!(c.open_vault(d.path()));
+        assert!(c.ensure_welcome());
+        assert_eq!(
+            c.document
+                .as_ref()
+                .map(|document| document.path.to_string()),
+            Some("Welcome.md".into())
+        );
+        assert!(
+            fs::read_to_string(d.path().join("Welcome.md"))
+                .unwrap()
+                .contains("Welcome to Tachylyte")
+        );
+    }
+
     #[test]
     fn toggles_and_search_are_render_independent() {
         let mut c = AppController::new();
