@@ -5396,6 +5396,7 @@ dependencies = [
  "tachylyte-core",
  "tachylyte-knowledge",
  "tachylyte-markdown",
+ "tachylyte-theme",
  "tempfile",
 ]
 
@@ -5468,6 +5469,15 @@ dependencies = [
  "gpui",
  "serde_json",
  "tachylyte-structured",
+]
+
+[[package]]
+name = "tachylyte-theme"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
