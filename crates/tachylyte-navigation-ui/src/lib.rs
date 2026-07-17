@@ -115,6 +115,9 @@ impl FileExplorerModel {
         flatten_nodes(&self.nodes, &self.state.collapsed, &self.state.filter)
     }
     pub fn reduce(&mut self, action: PaneAction) {
+        if !self.feature_enabled {
+            return;
+        }
         let ids: Vec<_> = self.visible().iter().map(|n| n.id.clone()).collect();
         self.state.reduce(action, ids.len(), |i| ids[i].clone());
     }
@@ -177,6 +180,9 @@ impl SearchResultsModel {
             .collect()
     }
     pub fn reduce(&mut self, action: PaneAction) {
+        if !self.feature_enabled {
+            return;
+        }
         let ids: Vec<_> = self.visible().iter().map(|x| x.path.clone()).collect();
         self.state.reduce(action, ids.len(), |i| ids[i].clone());
     }
@@ -204,6 +210,9 @@ impl ListPaneModel {
             .collect()
     }
     pub fn reduce(&mut self, action: PaneAction) {
+        if !self.feature_enabled {
+            return;
+        }
         let ids: Vec<_> = self.visible().iter().map(|x| x.id.clone()).collect();
         self.state.reduce(action, ids.len(), |i| ids[i].clone());
     }
@@ -244,7 +253,15 @@ impl FeatureVisibility {
         )
     }
     pub fn enabled(&self, feature: &str) -> bool {
-        self.0.get(feature).copied().unwrap_or(false)
+        tachylyte_core::FeatureRegistry::is_known(feature)
+            && self.0.get(feature).copied().unwrap_or(false)
+    }
+    pub fn set(&mut self, feature: &str, enabled: bool) -> bool {
+        if !tachylyte_core::FeatureRegistry::is_known(feature) {
+            return false;
+        }
+        self.0.insert(feature.to_string(), enabled);
+        true
     }
 }
 
@@ -264,31 +281,27 @@ pub trait PaneActivation {
     fn activate_id(&mut self, id: &str);
 }
 
+fn keyboard_action(key: &str, filter: &str) -> Option<PaneAction> {
+    match key {
+        "up" => Some(PaneAction::Up),
+        "down" => Some(PaneAction::Down),
+        "home" => Some(PaneAction::Home),
+        "end" => Some(PaneAction::End),
+        "enter" => Some(PaneAction::Activate),
+        "backspace" => Some(PaneAction::Filter(
+            filter
+                .chars()
+                .take(filter.chars().count().saturating_sub(1))
+                .collect(),
+        )),
+        value if value.chars().count() == 1 => Some(PaneAction::Filter(format!("{filter}{value}"))),
+        _ => None,
+    }
+}
+
 fn reduce_key<E: PaneActivation + 'static>(target: &Entity<E>, key: &str, app: &mut gpui::App) {
     target.update(app, |view, cx| {
-        let pane = view.pane();
-        let action = match key {
-            "up" => Some(PaneAction::Up),
-            "down" => Some(PaneAction::Down),
-            "home" => Some(PaneAction::Home),
-            "end" => Some(PaneAction::End),
-            "enter" => Some(PaneAction::Activate),
-            "backspace" => Some(PaneAction::Filter(
-                pane.state
-                    .filter
-                    .chars()
-                    .take(pane.state.filter.chars().count().saturating_sub(1))
-                    .collect(),
-            )),
-            value if value.chars().count() == 1 => Some(PaneAction::Filter(format!(
-                "{}{}",
-                pane.state.filter, value
-            ))),
-            _ => None,
-        };
-        if let Some(action) = action {
-            let ids: Vec<_> = pane.visible().iter().map(|item| item.id.clone()).collect();
-            pane.state.reduce(action, ids.len(), |i| ids[i].clone());
+        if view.pane().reduce_key(key) {
             cx.notify();
         }
     });
@@ -319,15 +332,48 @@ impl NavigationPane {
         }
     }
     pub fn visible(&self) -> Vec<&LabelItem> {
+        if !self.features.enabled(&self.feature) {
+            return Vec::new();
+        }
         self.items
             .iter()
             .filter(|x| matches_filter(&x.label, &self.state.filter))
             .collect()
     }
     fn activate_id(&mut self, id: &str) {
+        if !self.features.enabled(&self.feature) {
+            return;
+        }
         if let Some(index) = self.visible().iter().position(|item| item.id == id) {
             self.state.activate_at(index, id.to_string());
         }
+    }
+    pub fn reduce(&mut self, action: PaneAction) {
+        if !self.features.enabled(&self.feature) {
+            return;
+        }
+        let ids: Vec<_> = self.visible().iter().map(|item| item.id.clone()).collect();
+        self.state.reduce(action, ids.len(), |i| ids[i].clone());
+    }
+    /// Reduce the same key values used by the GPUI key-down handler.
+    pub fn reduce_key(&mut self, key: &str) -> bool {
+        if !self.features.enabled(&self.feature) {
+            return false;
+        }
+        let Some(action) = keyboard_action(key, &self.state.filter) else {
+            return false;
+        };
+        self.reduce(action);
+        true
+    }
+    pub fn set_feature_enabled(&mut self, enabled: bool) -> bool {
+        let changed = self.features.set(&self.feature, enabled);
+        if !self.features.enabled(&self.feature) {
+            self.state.filter.clear();
+            self.state.selected = 0;
+            self.state.events.clear();
+        }
+        changed
     }
 }
 impl PaneActivation for NavigationPane {
@@ -531,5 +577,76 @@ mod tests {
         assert!(model.visible().is_empty());
         model.feature_enabled = true;
         assert_eq!(model.visible().len(), 1);
+    }
+    #[test]
+    fn keyboard_handler_reduces_navigation_actions() {
+        assert_eq!(keyboard_action("down", ""), Some(PaneAction::Down));
+        assert_eq!(keyboard_action("enter", "q"), Some(PaneAction::Activate));
+        assert_eq!(
+            keyboard_action("x", "q"),
+            Some(PaneAction::Filter("qx".into()))
+        );
+        assert_eq!(
+            keyboard_action("backspace", "é"),
+            Some(PaneAction::Filter("".into()))
+        );
+        let mut pane = NavigationPane::new(
+            "Search",
+            "search",
+            vec![LabelItem {
+                id: "x".into(),
+                label: "X".into(),
+            }],
+        );
+        assert!(pane.reduce_key("down"));
+        assert!(pane.reduce_key("x"));
+        assert_eq!(pane.state.filter, "x");
+    }
+    #[test]
+    fn disabled_pane_has_no_visible_rows_or_events() {
+        let mut pane = NavigationPane::new(
+            "Unknown",
+            "not-a-feature",
+            vec![LabelItem {
+                id: "x".into(),
+                label: "X".into(),
+            }],
+        );
+        pane.state.filter = "x".into();
+        pane.state.selected = 1;
+        assert!(pane.visible().is_empty());
+        pane.reduce(PaneAction::Filter("new".into()));
+        pane.reduce(PaneAction::Down);
+        pane.reduce(PaneAction::Activate);
+        assert!(!pane.reduce_key("enter"));
+        pane.activate_id("x");
+        assert!(pane.state.events.is_empty());
+        assert_eq!(pane.state.filter, "x");
+    }
+    #[test]
+    fn disabling_feature_clears_interaction_state() {
+        let mut pane = NavigationPane::new(
+            "Search",
+            "search",
+            vec![LabelItem {
+                id: "x".into(),
+                label: "X".into(),
+            }],
+        );
+        pane.state.filter = "x".into();
+        pane.state.selected = 1;
+        pane.state.events.push(PaneEvent::Selected("x".into()));
+        assert!(pane.set_feature_enabled(false));
+        assert!(pane.state.filter.is_empty());
+        assert_eq!(pane.state.selected, 0);
+        assert!(pane.state.events.is_empty());
+        assert!(pane.set_feature_enabled(true));
+        assert!(pane.visible().len() == 1);
+    }
+    #[test]
+    fn unknown_feature_cannot_be_enabled() {
+        let mut visibility = FeatureVisibility::default();
+        assert!(!visibility.set("nope", true));
+        assert!(!visibility.enabled("nope"));
     }
 }
