@@ -6,9 +6,9 @@
 
 use gpui::{
     div, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, Context, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
-    InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, Pixels, Point, Render,
-    UTF16Selection, Window,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontWeight,
+    GlobalElementId, InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, Pixels,
+    Point, Render, UTF16Selection, Window,
 };
 use std::ops::Range;
 use tachylyte_markdown::{EditorDocument, Span, ViewMode};
@@ -351,6 +351,190 @@ fn tokens(text: &str, offset: usize) -> Vec<Token> {
     }]
 }
 
+// Keep the palette local to the editor so it remains usable in applications that do
+// not install a global GPUI theme. These are deliberately close to Obsidian's light
+// defaults: the violet is an accent, never the page background.
+const PAPER: u32 = 0xffff_ffff;
+const PANEL: u32 = 0xf6f6_f6ff;
+const INK: u32 = 0x2222_22ff;
+const MUTED: u32 = 0x5c5c_5cff;
+const BORDER: u32 = 0xe0e0_e0ff;
+const ACCENT: u32 = 0x7852_eeff;
+const CODE_BG: u32 = 0xf0eff5ff;
+const SELECTION: u32 = 0xded6_f8ff;
+
+fn mode_name(mode: ViewMode) -> &'static str {
+    match mode {
+        ViewMode::Source => "Source",
+        ViewMode::LivePreview => "Live preview",
+        ViewMode::Reading => "Reading",
+    }
+}
+
+fn inline_element(inline: &tachylyte_markdown::Inline) -> AnyElement {
+    use tachylyte_markdown::Inline;
+    match inline {
+        Inline::Text { value, .. } => div()
+            .text_color(rgb(INK))
+            .child(value.clone())
+            .into_any_element(),
+        Inline::Emphasis { children, .. } | Inline::Highlight { children, .. } => div()
+            .italic()
+            .text_color(rgb(INK))
+            .children(children.iter().map(inline_element))
+            .into_any_element(),
+        Inline::Strong { children, .. } => div()
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgb(INK))
+            .children(children.iter().map(inline_element))
+            .into_any_element(),
+        Inline::Code { value, .. } => div()
+            .bg(rgb(CODE_BG))
+            .text_color(rgb(ACCENT))
+            .child(format!(" {} ", value))
+            .into_any_element(),
+        Inline::Link { label, .. } => div()
+            .text_color(rgb(ACCENT))
+            .underline()
+            .child(label.clone())
+            .into_any_element(),
+        Inline::WikiLink { target, alias, .. } => div()
+            .text_color(rgb(ACCENT))
+            .underline()
+            .child(alias.clone().unwrap_or_else(|| target.clone()))
+            .into_any_element(),
+        Inline::Tag { value, .. } => div()
+            .text_color(rgb(ACCENT))
+            .child(value.clone())
+            .into_any_element(),
+        Inline::Math { value, .. } => div()
+            .text_color(rgb(ACCENT))
+            .child(value.clone())
+            .into_any_element(),
+        Inline::FootnoteRef { label, .. } => div()
+            .text_color(rgb(ACCENT))
+            .child(format!("[{}]", label))
+            .into_any_element(),
+        Inline::Embed { target, alias, .. } => div()
+            .text_color(rgb(MUTED))
+            .child(alias.clone().unwrap_or_else(|| target.clone()))
+            .into_any_element(),
+    }
+}
+
+fn block_element(block: &tachylyte_markdown::Block) -> AnyElement {
+    use tachylyte_markdown::Block;
+    match block {
+        Block::Heading {
+            level, children, ..
+        } => div()
+            .text_color(rgb(INK))
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(match level {
+                1 => 28.0,
+                2 => 23.0,
+                3 => 20.0,
+                _ => 17.0,
+            }))
+            .mb(px(10.0))
+            .children(children.iter().map(inline_element))
+            .into_any_element(),
+        Block::Paragraph { children, .. } => div()
+            .text_color(rgb(INK))
+            .text_size(px(16.0))
+            .mb(px(12.0))
+            .children(children.iter().map(inline_element))
+            .into_any_element(),
+        Block::Code {
+            language, value, ..
+        } => div()
+            .w_full()
+            .bg(rgb(CODE_BG))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded(px(5.0))
+            .p(px(12.0))
+            .mb(px(12.0))
+            .text_color(rgb(INK))
+            .child(format!(
+                "{}\n{}",
+                language.as_deref().unwrap_or("code"),
+                value
+            ))
+            .into_any_element(),
+        Block::Quote { children, .. } => div()
+            .border_l_2()
+            .border_color(rgb(ACCENT))
+            .pl(px(14.0))
+            .mb(px(12.0))
+            .children(children.iter().map(block_element))
+            .into_any_element(),
+        Block::Callout {
+            kind,
+            title,
+            children,
+            ..
+        } => div()
+            .w_full()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded(px(6.0))
+            .p(px(12.0))
+            .mb(px(12.0))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(ACCENT))
+                    .child(title.clone().unwrap_or_else(|| kind.clone())),
+            )
+            .children(children.iter().map(block_element))
+            .into_any_element(),
+        Block::List { ordered, items, .. } => div()
+            .mb(px(10.0))
+            .children(items.iter().enumerate().map(|(index, item)| {
+                let marker = if *ordered {
+                    format!("{}. ", index + 1)
+                } else if item.checked == Some(true) {
+                    "☑ ".into()
+                } else if item.checked == Some(false) {
+                    "☐ ".into()
+                } else {
+                    "• ".into()
+                };
+                div()
+                    .flex()
+                    .child(div().text_color(rgb(MUTED)).child(marker))
+                    .children(item.blocks.iter().map(block_element))
+                    .into_any_element()
+            }))
+            .into_any_element(),
+        Block::ThematicBreak { .. } => div()
+            .w_full()
+            .h(px(1.0))
+            .bg(rgb(BORDER))
+            .my(px(10.0))
+            .into_any_element(),
+        Block::Html { value, .. } | Block::Comment { value, .. } => div()
+            .text_color(rgb(MUTED))
+            .child(value.clone())
+            .into_any_element(),
+        Block::Table { headers, rows, .. } => div()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .p(px(8.0))
+            .mb(px(12.0))
+            .child(headers.join("  |  "))
+            .children(rows.iter().map(|row| {
+                div()
+                    .text_color(rgb(INK))
+                    .child(row.join("  |  "))
+                    .into_any_element()
+            }))
+            .into_any_element(),
+    }
+}
+
 /// A GPUI view over [`EditorState`]. Use `cx.new(|cx| MarkdownEditor::new(...))`.
 pub struct MarkdownEditor {
     pub state: EditorState,
@@ -477,31 +661,101 @@ impl Render for MarkdownEditor {
         let click_focus = focus.clone();
         let selection = self.state.selection();
         let cursor = self.state.cursor().0;
-        let lines = self.state.projection().into_iter().map(move |line| {
+        let mode = self.state.mode();
+        let source_lines = self.state.projection().into_iter().map(move |line| {
             let mut children = Vec::new();
             let selected = selection.range();
             let line_end = line.span.end;
             for (offset, grapheme) in line.text.grapheme_indices(true) {
                 let start = line.span.start + offset;
                 if start == cursor {
-                    children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
+                    children.push(div().text_color(rgb(ACCENT)).child("│").into_any_element());
                 }
                 let end = start + grapheme.len();
-                let style = if start < selected.end && end > selected.start {
-                    rgb(0x355070ff)
+                let is_selected = start < selected.end && end > selected.start;
+                let style = if is_selected {
+                    SELECTION
+                } else if mode == ViewMode::LivePreview
+                    && line.tokens.iter().any(|t| t.kind == SyntaxKind::Heading)
+                {
+                    ACCENT
+                } else if mode == ViewMode::LivePreview
+                    && line.tokens.iter().any(|t| t.kind == SyntaxKind::Code)
+                {
+                    ACCENT
                 } else {
-                    rgb(0x20242bff)
+                    INK
                 };
-                children.push(div().bg(style).child(grapheme.to_owned()));
+                let mut part = div()
+                    .text_color(rgb(style))
+                    .when(is_selected, |part| part.bg(rgb(SELECTION)))
+                    .child(grapheme.to_owned());
+                if mode == ViewMode::LivePreview
+                    && (grapheme == "*" || grapheme == "_" || grapheme == "`")
+                {
+                    part = part.text_color(rgb(MUTED));
+                }
+                children.push(part.into_any_element());
             }
             if cursor == line_end {
-                children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
+                children.push(div().text_color(rgb(ACCENT)).child("│").into_any_element());
             }
             div()
                 .flex()
-                .child(format!("{:>4}  ", line.number))
+                .text_size(px(15.0))
+                .child(
+                    div()
+                        .w(px(42.0))
+                        .text_color(rgb(MUTED))
+                        .child(format!("{:>3}", line.number)),
+                )
                 .children(children)
+                .into_any_element()
         });
+        let toolbar_entity = entity.clone();
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .p(px(8.0))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .children(
+                [ViewMode::Source, ViewMode::LivePreview, ViewMode::Reading]
+                    .into_iter()
+                    .map(move |button_mode| {
+                        let button_entity = toolbar_entity.clone();
+                        let active = mode == button_mode;
+                        div()
+                            .id(ElementId::Name(
+                                format!("mode-{}", mode_name(button_mode)).into(),
+                            ))
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .rounded(px(4.0))
+                            .bg(rgb(if active { ACCENT } else { PANEL }))
+                            .text_color(rgb(if active { PAPER } else { MUTED }))
+                            .child(mode_name(button_mode))
+                            .on_click(move |_, _, cx| {
+                                button_entity
+                                    .update(cx, |editor, _| editor.state.set_mode(button_mode));
+                            })
+                            .into_any_element()
+                    }),
+            );
+        let content = if mode == ViewMode::Reading {
+            div()
+                .w_full()
+                .max_w(px(820.0))
+                .mx_auto()
+                .p(px(32.0))
+                .children(self.state.document().blocks.iter().map(block_element))
+                .into_any_element()
+        } else {
+            div().p(px(14.0)).children(source_lines).into_any_element()
+        };
         div()
             .id("markdown-editor")
             .track_focus(&focus)
@@ -515,7 +769,10 @@ impl Render for MarkdownEditor {
             .flex()
             .flex_col()
             .overflow_y_scroll()
-            .child(div().children(lines))
+            .bg(rgb(PAPER))
+            .text_color(rgb(INK))
+            .child(toolbar)
+            .child(content)
             .input_handler(&focus, entity)
     }
 }
