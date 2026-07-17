@@ -9,3 +9,4 @@ description = "Native GPUI media leaf views for Tachylyte"
 gpui.workspace = true
 tachylyte-theme.workspace = true
 tachylyte-workflows.workspace = true
+url.workspace = true

@@ -5439,6 +5439,7 @@ dependencies = [
  "gpui",
  "tachylyte-theme",
  "tachylyte-workflows",
+ "url",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 use crate::{IntentQueue, LeafState, MediaIntent, MediaTokens};
 use gpui::{div, prelude::*, px, rgb, Context, Render, Window};
+use url::{Host, Url};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WebPolicy {
@@ -9,28 +10,100 @@ pub enum WebPolicy {
 
 impl WebPolicy {
     pub fn evaluate(&self, url: &str) -> Result<(), String> {
-        let host = url
-            .split("//")
-            .nth(1)
-            .and_then(|s| s.split('/').next())
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
-        if host.is_empty() {
-            return Err("URL has no host".into());
+        if url.chars().any(char::is_control) {
+            return Err("URL contains control characters".into());
         }
+        let parsed = Url::parse(url).map_err(|_| "URL could not be parsed".to_string())?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("URL scheme is not HTTP(S)".into());
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err("URL contains credentials".into());
+        }
+        // Url::parse rejects malformed ports, and this host-only policy rejects
+        // explicit ports too: accepting one would make an allow-list entry's
+        // meaning ambiguous when it does not include a port.
+        if parsed.port().is_some() {
+            return Err("URL contains an explicit port".into());
+        }
+        let host =
+            Self::normalize_url_host(&parsed).ok_or_else(|| "URL has no valid host".to_string())?;
         match self {
             Self::Offline => Err("offline policy blocks navigation".into()),
+            // The policy is exact-host or dot-delimited subdomain matching;
+            // this deliberately does not accept unrelated suffixes.
             Self::AllowList(list)
                 if list
                     .iter()
+                    .filter_map(|allowed| Self::normalize_allowed_host(allowed))
                     .any(|allowed| host == allowed || host.ends_with(&format!(".{allowed}"))) =>
             {
                 Ok(())
             }
             Self::AllowList(_) => Err(format!("host is not on the allow-list: {host}")),
         }
+    }
+
+    fn normalize_allowed_host(entry: &str) -> Option<String> {
+        // Entries are host names by default. A scheme is accepted only when
+        // the entry is an otherwise bare absolute HTTP(S) URL, avoiding the
+        // ambiguity of silently discarding paths, credentials, or ports.
+        let candidate = if entry.starts_with("http://") || entry.starts_with("https://") {
+            let parsed = Url::parse(entry).ok()?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.path() != "/"
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.port().is_some()
+            {
+                return None;
+            }
+            Self::normalize_url_host(&parsed)?
+        } else {
+            entry.to_owned()
+        };
+        if candidate.is_empty() || candidate.chars().any(char::is_control) {
+            return None;
+        }
+        let parsed = Url::parse(&format!("http://{candidate}")).ok()?;
+        if parsed.username() != ""
+            || parsed.password().is_some()
+            || parsed.path() != "/"
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.port().is_some()
+        {
+            return None;
+        }
+        Self::normalize_url_host(&parsed)
+    }
+
+    fn normalize_url_host(parsed: &Url) -> Option<String> {
+        match parsed.host()? {
+            Host::Domain(domain) => Self::normalize_domain(domain),
+            Host::Ipv4(address) => Some(address.to_string()),
+            Host::Ipv6(address) => Some(address.to_string()),
+        }
+    }
+
+    fn normalize_domain(domain: &str) -> Option<String> {
+        let domain = domain.trim_end_matches('.');
+        if domain.is_empty()
+            || domain.chars().any(char::is_control)
+            || domain.split('.').any(|label| {
+                label.is_empty()
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || character == '-')
+            })
+        {
+            return None;
+        }
+        Some(domain.to_ascii_lowercase())
     }
     pub fn allows(&self, url: &str) -> bool {
         self.evaluate(url).is_ok()
