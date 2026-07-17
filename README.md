@@ -1,9 +1,15 @@
 # Tachylyte
 
-Tachylyte is a native Rust knowledge-workspace shell. The bootstrap desktop
-frame is rendered with the crates.io release `gpui = "=0.2.2"`; it contains a
-title/tab strip, ribbon, collapsible sidebar state, editor placeholder, status
-bar, and a core-feature settings panel.
+Tachylyte is a native Rust, local-first knowledge workspace rendered with the
+crates.io release `gpui = "=0.2.2"`. It can open an existing vault, scan and
+edit Markdown files, save atomically, search and follow knowledge metadata, and
+toggle built-in feature surfaces. The workspace also contains reusable GPUI
+editor, navigation, Canvas, and Bases components plus render-neutral domain
+crates for compatibility behavior.
+
+This is an active compatibility implementation, not a completed 1:1 Obsidian
+replacement. See [`PARITY.md`](PARITY.md) for the evidence-backed distinction
+between implemented, model-only, and missing behavior.
 
 ## Linux prerequisites
 
@@ -21,13 +27,13 @@ The application needs a graphical session (`DISPLAY` or Wayland) at runtime.
 ## Build, run, and verify
 
 ```sh
-cargo run -p tachylyte-app
+cargo run -p tachylyte-app -- /path/to/existing/vault
 cargo fmt --check
 cargo doc --no-deps -p gpui
-cargo doc --no-deps -p tachylyte-app
-cargo check -p tachylyte-app --all-targets
-cargo test -p tachylyte-app
-cargo clippy -p tachylyte-app --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+cargo check --workspace --all-targets
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The workspace uses `crates/*` membership so future crates are discovered
