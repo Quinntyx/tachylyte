@@ -3,8 +3,12 @@
 //! All filesystem mutations are confined to the vault root and use an atomic
 //! temporary-file-and-rename strategy where applicable.
 
+#[cfg(target_os = "linux")]
+use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::{
     collections::BTreeMap,
     fmt, fs, io,
@@ -84,6 +88,8 @@ impl fmt::Display for VaultPath {
 #[derive(Clone, Debug)]
 pub struct Vault {
     root: PathBuf,
+    #[cfg(target_os = "linux")]
+    root_cap: Arc<fs::File>,
 }
 impl Vault {
     /// Open (or create) a vault directory.
@@ -91,13 +97,54 @@ impl Vault {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|e| io_at(&root, e))?;
         let root = fs::canonicalize(&root).map_err(|e| io_at(&root, e))?;
-        Ok(Self { root })
+        #[cfg(target_os = "linux")]
+        let root_cap = Arc::new(fs::File::open(&root).map_err(|e| io_at(&root, e))?);
+        Ok(Self {
+            root,
+            #[cfg(target_os = "linux")]
+            root_cap,
+        })
     }
     /// Absolute canonical vault root.
     pub fn root(&self) -> &Path {
         &self.root
     }
     fn checked(&self, p: &VaultPath, write: bool) -> Result<PathBuf, CoreError> {
+        // Linux operations are first anchored to an O_PATH-like capability and
+        // openat2's BENEATH|NO_SYMLINKS resolution. This is not a process-wide
+        // mutex: replacing a directory or symlink concurrently cannot redirect
+        // the capability lookup outside the vault. Other platforms retain the
+        // lexical/symlink checks below; callers should treat those platforms as
+        // lacking hostile concurrent-directory guarantees.
+        #[cfg(target_os = "linux")]
+        {
+            let relative = if write {
+                p.as_path().parent().unwrap_or(Path::new("."))
+            } else {
+                p.as_path()
+            };
+            let flags = OFlags::PATH
+                | if write {
+                    OFlags::DIRECTORY
+                } else {
+                    OFlags::empty()
+                };
+            let checked = openat2(
+                &*self.root_cap,
+                relative,
+                flags,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            );
+            if let Err(e) = checked {
+                if !(write && e.raw_os_error() == 2) {
+                    return Err(io_at(
+                        &self.root,
+                        io::Error::from_raw_os_error(e.raw_os_error()),
+                    ));
+                }
+            }
+        }
         let full = self.root.join(p.as_path());
         let mut current = self.root.clone();
         let components: Vec<_> = p.as_path().components().collect();
@@ -201,7 +248,26 @@ impl Vault {
         if let Some(parent) = b.parent() {
             fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
         }
-        fs::rename(&a, &b).map_err(|e| io_at(&b, e))
+        let metadata = fs::symlink_metadata(&a).map_err(|e| io_at(&a, e))?;
+        if metadata.is_dir() {
+            return Err(CoreError::Unsupported(
+                "directory rename is unavailable without a platform no-replace primitive".into(),
+            ));
+        }
+        fs::hard_link(&a, &b).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                CoreError::Duplicate(to.0.clone())
+            } else {
+                io_at(&b, e)
+            }
+        })?;
+        fs::remove_file(&a).map_err(|e| {
+            let _ = fs::remove_file(&b);
+            io_at(&a, e)
+        })?;
+        sync_parent(a.parent().unwrap());
+        sync_parent(b.parent().unwrap());
+        Ok(())
     }
     /// Delete a vault entry permanently.
     pub fn delete(&self, path: &VaultPath) -> Result<(), CoreError> {
@@ -212,7 +278,11 @@ impl Vault {
         } else {
             fs::remove_file(&p)
         }
-        .map_err(|e| io_at(&p, e))
+        .map_err(|e| io_at(&p, e))?;
+        if let Some(parent) = p.parent() {
+            sync_parent(parent);
+        }
+        Ok(())
     }
     /// Move an entry atomically into `.trash`, preserving its filename.
     pub fn trash(&self, path: &VaultPath) -> Result<VaultPath, CoreError> {
@@ -237,8 +307,25 @@ impl Vault {
         if dest.exists() {
             dest.set_file_name(format!("{}-{}", name.to_string_lossy(), unique_suffix()));
         }
-        fs::rename(&from, &dest).map_err(|e| io_at(&dest, e))?;
-        sync_parent(&self.root);
+        let metadata = fs::symlink_metadata(&from).map_err(|e| io_at(&from, e))?;
+        if metadata.is_dir() {
+            return Err(CoreError::Unsupported(
+                "directory trash is unavailable without a platform no-replace primitive".into(),
+            ));
+        }
+        fs::hard_link(&from, &dest).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                CoreError::Duplicate(dest.clone())
+            } else {
+                io_at(&dest, e)
+            }
+        })?;
+        fs::remove_file(&from).map_err(|e| {
+            let _ = fs::remove_file(&dest);
+            io_at(&from, e)
+        })?;
+        sync_parent(from.parent().unwrap());
+        sync_parent(dest.parent().unwrap());
         Ok(VaultPath::new(dest.strip_prefix(&self.root).unwrap()).expect("internal trash path"))
     }
     /// Scan supported Obsidian files, excluding hidden directories and `.trash`.
@@ -402,14 +489,31 @@ pub const CORE_FEATURES: &[&str] = &[
     "sync",
 ];
 /// Feature toggle registry.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FeatureRegistry {
-    #[serde(default)]
     enabled: BTreeMap<String, bool>,
 }
 impl Default for FeatureRegistry {
     fn default() -> Self {
         Self::defaults()
+    }
+}
+impl<'de> Deserialize<'de> for FeatureRegistry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            enabled: Option<BTreeMap<String, bool>>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut registry = Self::defaults();
+        if let Some(values) = wire.enabled {
+            for (id, state) in values {
+                if Self::is_known(&id) {
+                    registry.enabled.insert(id, state);
+                }
+            }
+        }
+        Ok(registry)
     }
 }
 impl FeatureRegistry {
@@ -549,6 +653,12 @@ mod tests {
         assert_eq!(v.read(&p).unwrap(), b"one");
         assert!(v.create(&p, b"two").is_err());
         v.write(&p, b"two").unwrap();
+        let occupied = VaultPath::new("occupied.md").unwrap();
+        v.create(&occupied, b"keep").unwrap();
+        assert!(matches!(
+            v.rename(&p, &occupied),
+            Err(CoreError::Duplicate(_))
+        ));
         v.rename(&p, &VaultPath::new("b.md").unwrap()).unwrap();
         let t = v.trash(&VaultPath::new("b.md").unwrap()).unwrap();
         assert!(t.as_path().starts_with(".trash"));
@@ -584,6 +694,12 @@ mod tests {
         let mut r = r;
         assert!(r.set("not-a-feature", true).is_err());
         assert_eq!(commands(&r).len(), CORE_FEATURES.len());
+        let missing: FeatureRegistry = serde_json::from_str("{}").unwrap();
+        assert!(missing.is_enabled("vault"));
+        let with_unknown: FeatureRegistry =
+            serde_json::from_str(r#"{"enabled":{"search":false,"future":true}}"#).unwrap();
+        assert!(!with_unknown.is_enabled("search"));
+        assert!(!with_unknown.is_enabled("future"));
     }
 
     #[cfg(unix)]
