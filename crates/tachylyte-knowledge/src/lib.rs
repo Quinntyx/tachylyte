@@ -228,7 +228,8 @@ pub fn search(index: &VaultIndex, query: &str) -> Result<Vec<SearchResult>, Quer
                 score,
                 snippet: terms
                     .iter()
-                    .find(|term| matches!(term.kind, TermKind::Plain | TermKind::Content))
+                    .filter(|term| matches!(term.kind, TermKind::Plain | TermKind::Content))
+                    .find(|term| contains_folded(&d.content, &term.value))
                     .map_or_else(String::new, |term| snippet(&d.content, &term.value)),
             }
         })
@@ -317,6 +318,11 @@ fn relevance(d: &Document, terms: &[SearchTerm]) -> u32 {
         })
         .sum()
 }
+fn contains_folded(text: &str, needle: &str) -> bool {
+    folded_with_boundaries(text)
+        .0
+        .contains(&needle.to_lowercase())
+}
 pub fn snippet(text: &str, query: &str) -> String {
     let q = query.split_whitespace().next().unwrap_or("").to_lowercase();
     if q.is_empty() {
@@ -373,13 +379,54 @@ pub struct Link {
     pub alias: Option<String>,
     pub resolved: bool,
 }
-fn resolve_target(index: &VaultIndex, target: &str) -> Option<String> {
-    index.get(target).map(|d| d.path.clone()).or_else(|| {
-        index
-            .documents()
-            .find(|d| d.path.file_stem() == Some(target))
-            .map(|d| d.path.clone())
-    })
+fn resolve_target(index: &VaultIndex, source: &str, target: &str) -> Option<String> {
+    let target = normalize_path(target);
+    if index.get(&target).is_some() {
+        return Some(target);
+    }
+    let source_parts = source.split('/').collect::<Vec<_>>();
+    let mut candidates = index
+        .documents()
+        .filter(|d| {
+            d.path.file_stem() == Some(target.as_str())
+                || d.path.rsplit('/').next() == Some(target.as_str())
+        })
+        .map(|d| {
+            let parts = d.path.split('/').collect::<Vec<_>>();
+            let common = source_parts
+                .iter()
+                .zip(parts.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (common, d.path.clone())
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let (best, path) = candidates.first()?;
+    if candidates.iter().skip(1).any(|(score, _)| score == best) {
+        None
+    } else {
+        Some(path.clone())
+    }
+}
+fn normalize_path(path: &str) -> String {
+    path.trim().trim_start_matches("./").replace('\\', "/")
+}
+fn canonical_target(index: &VaultIndex, target: &str) -> Option<String> {
+    let target = normalize_path(target);
+    if index.get(&target).is_some() {
+        return Some(target);
+    }
+    let mut matches = index
+        .documents()
+        .filter(|d| d.path.file_stem() == Some(target.as_str()))
+        .map(|d| d.path.clone());
+    let first = matches.next();
+    if first.is_some() && matches.next().is_none() {
+        first
+    } else {
+        None
+    }
 }
 pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
     let mut out = Vec::new();
@@ -394,7 +441,7 @@ pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
             let mut fields = raw.splitn(2, '|');
             let target = fields.next().unwrap_or("").trim().to_string();
             let alias = fields.next().map(|x| x.trim().to_string());
-            let resolved = resolve_target(index, &target).is_some();
+            let resolved = resolve_target(index, source, &target).is_some();
             out.push(Link {
                 source: source.into(),
                 target,
@@ -408,11 +455,15 @@ pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
     out
 }
 pub fn backlinks(index: &VaultIndex, target: &str) -> Vec<Link> {
-    let canonical = resolve_target(index, target).unwrap_or_else(|| target.to_string());
+    let Some(canonical) = canonical_target(index, target) else {
+        return Vec::new();
+    };
     index
         .documents()
         .flat_map(|d| links(index, &d.path))
-        .filter(|l| resolve_target(index, &l.target).as_deref() == Some(canonical.as_str()))
+        .filter(|l| {
+            resolve_target(index, &l.source, &l.target).as_deref() == Some(canonical.as_str())
+        })
         .collect()
 }
 
@@ -563,13 +614,10 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
             if !node_ids.contains(d.path.as_str()) {
                 continue;
             }
-            let target = if l.resolved {
-                ns.iter()
-                    .find(|n| n.id == l.target || n.id.file_stem() == Some(l.target.as_str()))
-                    .map(|n| n.id.clone())
-            } else {
-                Some(unresolved_id(&l.target))
-            };
+            let target = resolve_target(index, &d.path, &l.target)
+                .or_else(|| l.resolved.then(|| l.target.clone()))
+                .map_or_else(|| Some(unresolved_id(&l.target)), Some);
+            let target = target.filter(|id| !l.resolved || node_ids.contains(id.as_str()));
             if target.is_none() {
                 continue;
             }
@@ -724,6 +772,13 @@ mod tests {
         );
     }
     #[test]
+    fn or_snippet_uses_first_term_present_in_document() {
+        let mut i = VaultIndex::new();
+        i.upsert(d("a.md", "second appears here"));
+        let result = search(&i, "first OR second").unwrap();
+        assert!(result[0].snippet.contains("second"));
+    }
+    #[test]
     fn malformed_or_and_quoted_values() {
         assert!(parse_query("one OR").is_err());
         assert!(parse_query("OR one").is_err());
@@ -794,6 +849,18 @@ mod tests {
         i.upsert(d("source.md", "[[Target]]"));
         assert_eq!(backlinks(&i, "notes/Target.md")[0].source, "source.md");
         assert_eq!(backlinks(&i, "Target")[0].source, "source.md");
+    }
+    #[test]
+    fn duplicate_basenames_use_source_context_or_remain_ambiguous() {
+        let mut i = VaultIndex::new();
+        i.upsert(d("one/Target.md", ""));
+        i.upsert(d("two/Target.md", ""));
+        i.upsert(d("one/source.md", "[[Target]]"));
+        i.upsert(d("three/source.md", "[[Target]]"));
+        assert!(links(&i, "one/source.md")[0].resolved);
+        assert!(!links(&i, "three/source.md")[0].resolved);
+        assert_eq!(backlinks(&i, "one/Target.md").len(), 1);
+        assert_eq!(backlinks(&i, "two/Target.md").len(), 0);
     }
     #[test]
     fn graph_groups_and_edges_are_consistent() {
