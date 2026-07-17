@@ -1,0 +1,15 @@
+# Local research inputs (proprietary Obsidian distribution)
+/app.asar.unpacked/
+
+# Internal architecture/session state
+/ROADMAP.md
+/.opencode-cache/
+
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
