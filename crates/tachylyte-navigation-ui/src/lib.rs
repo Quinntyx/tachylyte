@@ -186,8 +186,26 @@ pub type GraphLegendModel = ListPaneModel;
 #[derive(Clone, Debug, Default)]
 pub struct FeatureVisibility(pub BTreeMap<String, bool>);
 impl FeatureVisibility {
+    pub fn from_registry(registry: &tachylyte_core::FeatureRegistry) -> Self {
+        Self(
+            tachylyte_core::CORE_FEATURES
+                .iter()
+                .map(|feature| ((*feature).to_string(), registry.is_enabled(feature)))
+                .collect(),
+        )
+    }
     pub fn enabled(&self, feature: &str) -> bool {
         self.0.get(feature).copied().unwrap_or(true)
+    }
+}
+
+impl From<tachylyte_knowledge::SearchResult> for SearchItem {
+    fn from(result: tachylyte_knowledge::SearchResult) -> Self {
+        Self {
+            path: result.path,
+            snippet: result.snippet,
+            score: result.score,
+        }
     }
 }
 
