@@ -7,6 +7,16 @@
 use gpui::Hsla;
 use serde::{Deserialize, Serialize};
 
+/// Flat semantic accessors for native view integrations.
+pub mod accessors;
+/// Versioned persistence helpers for appearance settings.
+pub mod appearance;
+/// Allocation-free packed-color conversion helpers.
+pub mod color;
+
+pub use appearance::{decode_appearance, encode_appearance, CURRENT_VERSION};
+pub use color::{hex_rgb, hex_rgba, rgba8, HslaColorExt};
+
 /// The requested appearance mode. `System` is resolved by the host application.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ThemeKind {
@@ -214,56 +224,56 @@ const fn rgba(h: f32, s: f32, l: f32, a: f32) -> Hsla {
 }
 
 const LIGHT: Palette = Palette {
-    base00: c(0.0, 0.0, 100.0),
-    base05: c(0.0, 0.0, 98.0),
-    base10: c(0.0, 0.0, 96.0),
-    base20: c(0.0, 0.0, 94.0),
-    base25: c(0.0, 0.0, 92.0),
-    base30: c(0.0, 0.0, 88.0),
-    base35: c(0.0, 0.0, 84.0),
-    base40: c(0.0, 0.0, 74.0),
-    base50: c(0.0, 0.0, 60.0),
-    base60: c(0.0, 0.0, 44.0),
-    base70: c(0.0, 0.0, 36.0),
-    base100: c(0.0, 0.0, 12.0),
+    base00: hex_rgb(0xffffff),
+    base05: hex_rgb(0xfcfcfc),
+    base10: hex_rgb(0xfafafa),
+    base20: hex_rgb(0xf6f6f6),
+    base25: hex_rgb(0xe3e3e3),
+    base30: hex_rgb(0xe0e0e0),
+    base35: hex_rgb(0xd4d4d4),
+    base40: hex_rgb(0xbdbdbd),
+    base50: hex_rgb(0xababab),
+    base60: hex_rgb(0x707070),
+    base70: hex_rgb(0x5c5c5c),
+    base100: hex_rgb(0x222222),
     accent: c(258.0, 88.0, 66.0),
-    accent_hover: c(258.0, 88.0, 60.0),
-    accent_active: c(258.0, 88.0, 54.0),
-    red: c(350.0, 80.0, 55.0),
-    orange: c(28.0, 100.0, 46.0),
-    yellow: c(45.0, 100.0, 44.0),
-    green: c(145.0, 92.0, 38.0),
-    cyan: c(178.0, 100.0, 37.0),
-    blue: c(215.0, 94.0, 45.0),
-    purple: c(256.0, 82.0, 63.0),
+    accent_hover: c(255.0, 89.76, 75.9),
+    accent_active: c(257.0, 88.88, 70.95),
+    red: hex_rgb(0xe93147),
+    orange: hex_rgb(0xec7500),
+    yellow: hex_rgb(0xe0ac00),
+    green: hex_rgb(0x08b94e),
+    cyan: hex_rgb(0x00bfbc),
+    blue: hex_rgb(0x086ddd),
+    purple: hex_rgb(0x7852ee),
     background: BackgroundTokens {
-        app: c(0.0, 0.0, 100.0),
-        primary: c(0.0, 0.0, 100.0),
-        secondary: c(0.0, 0.0, 96.0),
-        elevated: c(0.0, 0.0, 100.0),
-        code: c(0.0, 0.0, 96.0),
-        selection: rgba(258.0, 88.0, 66.0, 0.18),
+        app: hex_rgb(0xffffff),
+        primary: hex_rgb(0xffffff),
+        secondary: hex_rgb(0xf6f6f6),
+        elevated: hex_rgb(0xfcfcfc),
+        code: hex_rgb(0xfafafa),
+        selection: rgba(258.0, 88.0, 66.0, 0.2),
     },
     borders: BorderTokens {
-        subtle: c(0.0, 0.0, 92.0),
-        default: c(0.0, 0.0, 86.0),
-        strong: c(0.0, 0.0, 74.0),
-        focus: c(258.0, 88.0, 66.0),
+        subtle: hex_rgb(0xe0e0e0),
+        default: hex_rgb(0xe0e0e0),
+        strong: hex_rgb(0xd4d4d4),
+        focus: hex_rgb(0xbdbdbd),
     },
     text: TextTokens {
-        normal: c(0.0, 0.0, 18.0),
-        muted: c(0.0, 0.0, 44.0),
-        faint: c(0.0, 0.0, 60.0),
+        normal: hex_rgb(0x222222),
+        muted: hex_rgb(0x5c5c5c),
+        faint: hex_rgb(0xababab),
         on_accent: c(0.0, 0.0, 100.0),
         link: c(215.0, 94.0, 45.0),
-        title: c(0.0, 0.0, 12.0),
+        title: hex_rgb(0x222222),
     },
     interactive: InteractiveTokens {
-        hover: c(0.0, 0.0, 96.0),
-        active: c(0.0, 0.0, 92.0),
-        selected: rgba(258.0, 88.0, 66.0, 0.14),
-        disabled: c(0.0, 0.0, 74.0),
-        focus_ring: c(258.0, 88.0, 66.0),
+        hover: hex_rgb(0xfafafa),
+        active: rgba(258.0, 88.0, 66.0, 0.1),
+        selected: rgba(258.0, 88.0, 66.0, 0.15),
+        disabled: hex_rgb(0xbdbdbd),
+        focus_ring: hex_rgb(0xbdbdbd),
     },
     titlebar: SurfaceTokens {
         background: c(0.0, 0.0, 98.0),
