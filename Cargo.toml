@@ -9,3 +9,6 @@ version = "0.1.0"
 
 [workspace.dependencies]
 gpui = "=0.2.2"
+tachylyte-core = { path = "crates/tachylyte-core" }
+tachylyte-knowledge = { path = "crates/tachylyte-knowledge" }
+tachylyte-markdown = { path = "crates/tachylyte-markdown" }
