@@ -66,6 +66,23 @@ impl BaseModel {
             commands: Vec::new(),
         }
     }
+
+    /// Replace records supplied by the host while retaining view state.
+    pub fn update_records(&mut self, records: Vec<Record>) {
+        self.records = records;
+        self.selected = None;
+    }
+
+    /// Replace the definition while retaining the current record snapshot.
+    pub fn update_document(&mut self, document: BaseDocument) {
+        self.document = document;
+        self.selected = None;
+    }
+
+    /// Enable or disable user interaction for this projection.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+    }
     /// Build a projection with stable columns and source indices.
     pub fn projection(&self) -> BaseProjection {
         // Keep source identity attached to the borrowed record for the whole
@@ -204,13 +221,59 @@ impl BasesView {
     pub fn new(model: BaseModel) -> Self {
         Self { model }
     }
+
+    /// Construct a view directly from a document and host-loaded records.
+    pub fn from_document(document: BaseDocument, records: Vec<Record>) -> Self {
+        Self::new(BaseModel::new(document, records))
+    }
+
+    /// Replace the records rendered by the view.
+    pub fn update_records(&mut self, records: Vec<Record>) {
+        self.model.update_records(records);
+    }
+
+    /// Replace the Bases definition without rebuilding the mounted view.
+    pub fn update_document(&mut self, document: BaseDocument) {
+        self.model.update_document(document);
+    }
+
+    /// Enable or disable interaction, for example while loading or read-only.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.model.set_disabled(disabled);
+    }
+
+    /// Drain commands emitted by controls since the last update.
+    pub fn take_commands(&mut self) -> Vec<BaseCommand> {
+        self.model.take_commands()
+    }
 }
 impl Render for BasesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let projection = self.model.projection();
         let selected = self.model.selected;
-        let mut body = div().flex().flex_col().gap_1().p_2();
+        let columns = projection.columns.clone();
+        let row_count = projection.rows.len();
+        let disabled = self.model.disabled;
+        let mut body = div().flex().flex_col().p_2().bg(rgb(0xffffffff));
+        if !columns.is_empty() {
+            let headings = columns
+                .iter()
+                .map(|column| format!("▦  {column}"))
+                .collect::<Vec<_>>()
+                .join("     ");
+            body = body.child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_color(rgb(0x5c5c5cff))
+                    .border_b_1()
+                    .border_color(rgb(0xe0e0e0ff))
+                    .child(headings),
+            );
+        }
         for row in projection.rows {
             let active = selected == Some(row.source_index);
             let text = row
@@ -224,9 +287,15 @@ impl Render for BasesView {
             let child = div()
                 .id(SharedString::from(format!("base-row-{index}")))
                 .w_full()
-                .p_2()
-                .bg(rgb(if active { 0x3e5c76ff } else { 0x292d35ff }))
-                .text_color(rgb(0xffffffff))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .px_2()
+                .border_b_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .bg(rgb(if active { 0xf0f0f0ff } else { 0xffffffff }))
+                .text_color(rgb(if active { 0x333333ff } else { 0x222222ff }))
+                .hover(|style| style.bg(rgb(0xeeeeeeff)))
                 .child(text)
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     e.update(cx, |view, cx| {
@@ -236,63 +305,99 @@ impl Render for BasesView {
                 });
             body = body.child(child);
         }
+        if row_count == 0 {
+            body = body.child(div().p_2().text_color(rgb(0x5c5c5cff)).child(if disabled {
+                "Unavailable while disabled"
+            } else {
+                "No records yet"
+            }));
+        }
         let e = entity.clone();
         let cards = entity.clone();
         let list = entity.clone();
         let sort = entity.clone();
         let filter = entity.clone();
-        let disabled = self.model.disabled;
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x202124ff))
-            .text_color(rgb(0xffffffff))
+            .bg(rgb(if disabled { 0xf1f1f1ff } else { 0xf6f6f6ff }))
+            .text_color(rgb(0x222222ff))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(px(36.))
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .bg(rgb(0x30343bff))
+                    .bg(rgb(0xffffffff))
+                    .border_b_1()
+                    .border_color(rgb(0xe0e0e0ff))
+                    .text_color(rgb(if disabled { 0x888888ff } else { 0x222222ff }))
                     .child(if disabled {
-                        "Bases (disabled)"
+                        "▦  Bases (disabled)"
                     } else {
-                        "Bases"
+                        "▦  Bases"
                     })
-                    .child(div().id("bases-table").p_1().child("Table").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            e.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::Table);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(div().id("bases-cards").p_1().child("Cards").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            cards.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::Cards);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(div().id("bases-list").p_1().child("List").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            list.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::List);
-                                cx.notify();
-                            });
-                        },
-                    ))
+                    .child(
+                        div()
+                            .id("bases-table")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("▤ Table")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                e.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::Table);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("bases-cards")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("▦ Cards")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                cards.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::Cards);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("bases-list")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("☷ List")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                list.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::List);
+                                    cx.notify();
+                                });
+                            }),
+                    )
                     .child(
                         div()
                             .id("bases-filter")
-                            .p_1()
-                            .child("Filter")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .border_1()
+                            .border_color(rgb(0xe0e0e0ff))
+                            .bg(rgb(0xfafafaff))
+                            .child(if self.model.filter.is_empty() {
+                                "⌕  Filter"
+                            } else {
+                                "⌕  Filtered"
+                            })
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 filter.update(cx, |v, cx| {
                                     v.model.set_filter("");
@@ -300,19 +405,25 @@ impl Render for BasesView {
                                 });
                             }),
                     )
-                    .child(div().id("bases-sort").p_1().child("Sort").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            sort.update(cx, |v, cx| {
-                                if let Some(property) =
-                                    v.model.projection().columns.first().cloned()
-                                {
-                                    v.model.set_sort(property, Direction::Asc);
-                                }
-                                cx.notify();
-                            });
-                        },
-                    )),
+                    .child(
+                        div()
+                            .id("bases-sort")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("↕ Sort")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                sort.update(cx, |v, cx| {
+                                    if let Some(property) =
+                                        v.model.projection().columns.first().cloned()
+                                    {
+                                        v.model.set_sort(property, Direction::Asc);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    ),
             )
             .child(body)
     }

@@ -4,7 +4,7 @@
 //! snapshots from `tachylyte-core`/`tachylyte-knowledge`, reduce actions, and subscribe to
 //! the small event vocabulary below.
 
-use gpui::{div, prelude::*, Context, Entity, Render, Window};
+use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, Window};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
@@ -70,6 +70,11 @@ impl SelectionModel {
             PaneAction::Home => self.selected = 0,
             PaneAction::End => self.selected = count.saturating_sub(1),
             PaneAction::Activate => {
+                self.selected = if count == 0 {
+                    0
+                } else {
+                    self.selected.min(count - 1)
+                };
                 if count > 0 {
                     self.activate_at(self.selected, selected_id(self.selected));
                     return;
@@ -108,6 +113,24 @@ pub struct FileExplorerModel {
     pub feature_enabled: bool,
 }
 impl FileExplorerModel {
+    /// Create an enabled file explorer from a tree snapshot.
+    pub fn new(nodes: Vec<FileNode>) -> Self {
+        Self {
+            nodes,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, nodes: Vec<FileNode>) {
+        self.nodes = nodes;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&FileNode> {
         if !self.feature_enabled {
             return Vec::new();
@@ -170,6 +193,23 @@ pub struct SearchResultsModel {
     pub feature_enabled: bool,
 }
 impl SearchResultsModel {
+    pub fn new(items: Vec<SearchItem>) -> Self {
+        Self {
+            items,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, items: Vec<SearchItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&SearchItem> {
         if !self.feature_enabled {
             return Vec::new();
@@ -200,6 +240,23 @@ pub struct ListPaneModel {
     pub feature_enabled: bool,
 }
 impl ListPaneModel {
+    pub fn new(items: Vec<LabelItem>) -> Self {
+        Self {
+            items,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, items: Vec<LabelItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&LabelItem> {
         if !self.feature_enabled {
             return Vec::new();
@@ -340,6 +397,17 @@ impl NavigationPane {
             .filter(|x| matches_filter(&x.label, &self.state.filter))
             .collect()
     }
+    /// Replace the pane snapshot while retaining filter and feature settings.
+    pub fn update_items(&mut self, items: Vec<LabelItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     fn activate_id(&mut self, id: &str) {
         if !self.features.enabled(&self.feature) {
             return;
@@ -396,20 +464,35 @@ fn render_navigation_content<E: PaneActivation + 'static>(
     if !pane.features.enabled(&pane.feature) {
         return div()
             .id("navigation-pane-disabled")
+            .p_2()
+            .bg(rgb(0xf1f1f1ff))
+            .text_color(rgb(0x5c5c5cff))
             .child(format!("{} unavailable", pane.title));
     }
     let title = pane.title.clone();
+    let count = pane.visible().len();
+    let filter = pane.state.filter.clone();
     let rows = pane.visible().into_iter().enumerate().map(|(i, item)| {
         let id = item.id.clone();
         let mut row = div()
             .id(("navigation-row", i))
             .focusable()
             .tab_index(i as isize)
-            .p_1()
-            .child(if i == pane.state.selected {
-                format!("selected: {}", item.label)
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(rgb(if i == pane.state.selected {
+                0x6b3fa0ff
             } else {
-                item.label.clone()
+                0x222222ff
+            }))
+            .hover(|style| style.bg(rgb(0xeeeeeeff)))
+            .child(if i == pane.state.selected {
+                format!("●  {}", item.label)
+            } else {
+                format!("   {}", item.label)
             });
         let target = target.clone();
         row = row.on_click(move |_, _, cx| {
@@ -429,8 +512,53 @@ fn render_navigation_content<E: PaneActivation + 'static>(
         .on_key_down(move |event, _, app| reduce_key(&key_target, &event.keystroke.key, app))
         .flex()
         .flex_col()
-        .child(title)
+        .bg(rgb(0xf6f6f6ff))
+        .text_color(rgb(0x222222ff))
+        .child(
+            div()
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .border_b_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .child(format!("☰  {title}"))
+                .child(
+                    div()
+                        .px_1()
+                        .text_color(rgb(0x5c5c5cff))
+                        .child(count.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .mx_2()
+                .my_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .px_2()
+                .border_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .bg(rgb(0xffffffff))
+                .text_color(rgb(0x5c5c5cff))
+                .child(if filter.is_empty() {
+                    "⌕  Search"
+                } else {
+                    "⌕  Filtered"
+                }),
+        )
         .children(rows)
+        .child(if count == 0 {
+            div()
+                .px_2()
+                .py_2()
+                .text_color(rgb(0x5c5c5cff))
+                .child("Nothing here yet")
+        } else {
+            div()
+        })
 }
 
 macro_rules! pane_view {
@@ -466,6 +594,52 @@ pane_view!(Properties);
 pane_view!(Bookmarks);
 pane_view!(GraphList);
 pane_view!(GraphLegend);
+
+/// The standard navigation surface used by workspace integrations.
+///
+/// The panes remain independent so callers can mount them in their preferred
+/// layout, while this small facade provides one place to construct, update,
+/// and drain their interaction events.
+#[derive(Clone, Debug)]
+pub struct WorkspacePanes {
+    pub file: FileExplorer,
+    pub search: SearchResults,
+    pub outline: Outline,
+}
+
+impl WorkspacePanes {
+    pub fn new(files: Vec<LabelItem>, results: Vec<LabelItem>, outline: Vec<LabelItem>) -> Self {
+        Self {
+            file: FileExplorer {
+                pane: NavigationPane::new("Files", "file-explorer", files),
+            },
+            search: SearchResults {
+                pane: NavigationPane::new("Search", "search", results),
+            },
+            // Outline has no separate core feature flag; it is part of the
+            // workspace navigation surface.
+            outline: Outline {
+                pane: NavigationPane::new("Outline", "workspace", outline),
+            },
+        }
+    }
+
+    pub fn update_file(&mut self, items: Vec<LabelItem>) {
+        self.file.pane.update_items(items);
+    }
+    pub fn update_search(&mut self, items: Vec<LabelItem>) {
+        self.search.pane.update_items(items);
+    }
+    pub fn update_outline(&mut self, items: Vec<LabelItem>) {
+        self.outline.pane.update_items(items);
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        let mut events = self.file.pane.take_events();
+        events.extend(self.search.pane.take_events());
+        events.extend(self.outline.pane.take_events());
+        events
+    }
+}
 
 #[cfg(test)]
 mod tests {
