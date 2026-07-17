@@ -2,10 +2,11 @@
 //! A small, testable GPUI shell for a local Markdown vault.
 
 use gpui::{
-    div, prelude::*, px, rgb, App, Application, Context, FocusHandle, KeyDownEvent, Render, Window,
-    WindowOptions,
+    div, prelude::*, px, rgb, App, Application, Context, FocusHandle, KeyDownEvent,
+    Render, Size, Window, WindowBounds, WindowOptions,
 };
-use std::{env, path::Path};
+use serde::{Deserialize, Serialize};
+use std::{env, fs, path::{Path, PathBuf}, process::Command};
 use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
 use tachylyte_markdown::{EditorDocument, ViewMode};
@@ -55,7 +56,7 @@ pub struct SettingsState {
 impl Default for SettingsState {
     fn default() -> Self {
         Self {
-            theme: Theme::Dark,
+            theme: Theme::Light,
             show_left_sidebar: true,
             show_right_sidebar: true,
             features: CORE_FEATURES
@@ -456,11 +457,111 @@ impl AppController {
                 self.settings.toggle_feature("Properties");
                 true
             }
+            "manage vaults" | "vaults" => {
+                self.status = "Use the vault manager to switch vaults".into();
+                true
+            }
             _ => {
                 self.status = format!("Unknown command: {command}");
                 false
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecentVault {
+    path: PathBuf,
+    name: String,
+}
+
+fn recent_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|p| p.join("tachylyte").join("recent-vaults.json"))
+}
+
+fn load_recent() -> Vec<RecentVault> {
+    recent_file()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_recent(recent: &[RecentVault]) {
+    let Some(path) = recent_file() else { return };
+    if let Some(parent) = path.parent() { let _ = fs::create_dir_all(parent); }
+    if let Ok(json) = serde_json::to_string_pretty(recent) { let _ = fs::write(path, json); }
+}
+
+fn remember_vault(path: &Path, recent: &mut Vec<RecentVault>) {
+    recent.retain(|v| v.path != path);
+    recent.insert(0, RecentVault { path: path.to_path_buf(), name: path.file_name().and_then(|n| n.to_str()).unwrap_or("Vault").to_owned() });
+    recent.truncate(8);
+    save_recent(recent);
+}
+
+/// Compact vault chooser shown when startup has no usable vault.
+pub struct Launcher {
+    recent: Vec<RecentVault>,
+    name_input: String,
+    path_input: String,
+    editing_name: bool,
+    message: String,
+    focus_handle: FocusHandle,
+}
+
+impl Launcher {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self { recent: load_recent(), name_input: String::new(), path_input: String::new(), editing_name: false, message: String::new(), focus_handle: cx.focus_handle() }
+    }
+
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let mut controller = AppController::new();
+        if controller.open_vault(&path) {
+            remember_vault(&path, &mut self.recent);
+            let _ = open_workspace_window(cx, controller);
+            window.prevent_default();
+            self.message = format!("Opened {}", path.display());
+        } else { self.message = controller.status; }
+        cx.notify();
+    }
+
+    fn create_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.name_input.trim();
+        let parent = self.path_input.trim();
+        if name.is_empty() || parent.is_empty() { self.message = "Enter a vault name and parent folder.".into(); cx.notify(); return; }
+        let path = Path::new(parent).join(name);
+        match fs::create_dir_all(&path) {
+            Ok(()) => self.open_path(path, window, cx),
+            Err(e) => { self.message = format!("Could not create vault: {e}"); cx.notify(); }
+        }
+    }
+}
+
+impl Render for Launcher {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let recent = self.recent.clone();
+        let cards = recent.into_iter().enumerate().map(|(i, vault)| {
+            let open_entity = entity.clone(); let remove_entity = entity.clone();
+            let path = vault.path.clone(); let remove_path = path.clone(); let reveal_path = path.clone();
+            let stale = !path.is_dir();
+            div().flex().items_center().gap_2().p_2().border_1().border_color(rgb(0xe0e0e0))
+                .child(div().flex_1().child(format!("{}\n{}{}", vault.name, path.display(), if stale { "  · unavailable" } else { "" })))
+                .child(div().id(("recent-open", i)).px_2().py_1().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| open_entity.update(c, |l, c| l.open_path(path.clone(), w, c))).child("Open"))
+                .child(div().id(("recent-reveal", i)).px_2().py_1().on_mouse_down(gpui::MouseButton::Left, move |_, _, _| { let _ = Command::new("xdg-open").arg(reveal_path.clone()).spawn(); }).child("Reveal"))
+                .child(div().id(("recent-remove", i)).px_2().py_1().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| remove_entity.update(c, |l, c| { l.recent.retain(|v| v.path != remove_path); save_recent(&l.recent); c.notify(); })).child("Remove"))
+        });
+        let create_entity = entity.clone(); let pick_entity = entity.clone(); let open_entity = entity.clone();
+        let name_entity = entity.clone(); let path_entity = entity.clone();
+        div().size_full().bg(rgb(0xffffff)).text_color(rgb(0x222222)).flex().flex_col().items_center().p_8()
+            .child(div().text_xl().child("◈  TACHYLYTE")).child(div().text_sm().text_color(rgb(0x5c5c5c)).child("Your notes, your space."))
+            .child(div().mt_6().w(px(620.)).child("Recent vaults")).child(div().w(px(620.)).flex().flex_col().gap_2().mt_2().children(cards))
+            .child(div().w(px(620.)).mt_5().flex().gap_2().items_center().child("Create new vault").child(div().flex_1().border_1().border_color(rgb(0xe0e0e0)).p_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| name_entity.update(c, |l, c| { l.editing_name = true; c.notify(); })).child(self.name_input.clone())).child(div().id("create-vault").px_3().py_2().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| create_entity.update(c, |l, c| l.create_vault(w, c))).child("Create")))
+            .child(div().w(px(620.)).mt_2().flex().gap_2().items_center().child("Parent folder").child(div().flex_1().border_1().border_color(rgb(0xe0e0e0)).p_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| path_entity.update(c, |l, c| { l.editing_name = false; c.notify(); })).child(self.path_input.clone())).child(div().id("pick-folder").px_3().py_2().on_mouse_down(gpui::MouseButton::Left, move |_, _, c| { if let Some(path) = rfd::FileDialog::new().set_title("Choose vault parent folder").pick_folder() { pick_entity.update(c, |l, c| { l.path_input = path.display().to_string(); l.editing_name = false; c.notify(); }); } }).child("Browse")))
+            .child(div().w(px(620.)).mt_2().flex().gap_2().items_center().child("Open folder as vault").child(div().flex_1().border_1().border_color(rgb(0xe0e0e0)).p_2().child(self.path_input.clone())).child(div().id("open-folder").px_3().py_2().bg(rgb(0x7852ee)).text_color(rgb(0xffffff)).on_mouse_down(gpui::MouseButton::Left, move |_, w, c| open_entity.update(c, |l, c| l.open_path(PathBuf::from(l.path_input.trim()), w, c))).child("Open")))
+            .child(div().mt_4().text_color(rgb(0x5c5c5c)).child(self.message.clone())).child(div().flex_1())
+            .child(div().text_sm().text_color(rgb(0x5c5c5c)).child("Help  ·  English  ·  Manage your vaults locally"))
+            .track_focus(&self.focus_handle).on_key_down(cx.listener(|launcher, event: &KeyDownEvent, _, cx| { let input = if launcher.editing_name { &mut launcher.name_input } else { &mut launcher.path_input }; if event.keystroke.key.as_str() == "backspace" { input.pop(); } else if let Some(ch) = &event.keystroke.key_char { if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform { input.push_str(ch); } } cx.notify(); }))
     }
 }
 
@@ -472,9 +573,9 @@ pub struct Shell {
     pub focus_handle: FocusHandle,
 }
 impl Shell {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn with_controller(controller: AppController, cx: &mut Context<Self>) -> Self {
         Self {
-            controller: AppController::open_from_environment(),
+            controller,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -482,9 +583,9 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let light = self.controller.settings.theme == Theme::Light;
-        let bg = if light { 0xf7f7f7ff } else { 0x1e1e1eff };
-        let panel = if light { 0xffffffff } else { 0x252526ff };
-        let fg = if light { 0x242424ff } else { 0xd4d4d4ff };
+        let bg = if light { 0xfafafa } else { 0x1e1e1e };
+        let panel = if light { 0xffffff } else { 0x252526 };
+        let fg = if light { 0x222222 } else { 0xd4d4d4 };
         let entries = self
             .controller
             .entries
@@ -504,6 +605,7 @@ impl Render for Shell {
             |d| d.editor.source().to_owned(),
         );
         let entity = cx.entity();
+        let manage_entity = entity.clone();
         let palette_entity = entity.clone();
         let source_entity = entity.clone();
         let reading_entity = entity.clone();
@@ -514,7 +616,7 @@ impl Render for Shell {
                 .id("file-row")
                 .p_1()
                 .w_full()
-                .hover(|s| s.bg(rgb(0x3b3b3bff)))
+                .hover(|s| s.bg(rgb(0xe0e0e0)))
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     if let Ok(p) = VaultPath::new(&path) {
                         e.update(cx, |shell, cx| {
@@ -588,7 +690,7 @@ impl Render for Shell {
                 .bg(rgb(panel))
                 .p_4()
                 .border_1()
-                .border_color(rgb(0x808080ff))
+                .border_color(rgb(0xe0e0e0))
                 .child(format!(
                     "COMMAND PALETTE\n{}\n{}\nCtrl/Cmd+S Save · Enter execute",
                     self.controller.query, search_results
@@ -688,7 +790,7 @@ impl Render for Shell {
                                     .flex_1()
                                     .p_3()
                                     .border_1()
-                                    .border_color(rgb(0x3b3b3bff))
+                                    .border_color(rgb(0xe0e0e0))
                                     .track_focus(&self.focus_handle)
                                     .on_key_down(cx.listener(
                                         |shell, event: &KeyDownEvent, window, cx| {
@@ -784,21 +886,42 @@ impl Render for Shell {
                     .h(px(26.))
                     .px_3()
                     .bg(rgb(panel))
-                    .child("Ready  ·  Ctrl/Cmd+P palette  ·  Ctrl/Cmd+S save"),
+                    .child(div().id("manage-vaults").text_color(rgb(0x7852ee)).on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| manage_entity.update(cx, |shell, cx| { shell.controller.execute_command("manage vaults"); cx.notify(); })).child("Manage vaults"))
+                    .child("  ·  Ready  ·  Ctrl/Cmd+P palette  ·  Ctrl/Cmd+S save"),
             )
             .child(palette)
     }
 }
 
-/// Open the desktop window.
-pub fn open_shell_window(cx: &mut App) -> gpui::Result<()> {
-    cx.open_window(WindowOptions::default(), |_window, cx| cx.new(Shell::new))
+/// Open the normal workspace window with a controller that has a valid vault.
+pub fn open_workspace_window(cx: &mut App, controller: AppController) -> gpui::Result<()> {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(Size { width: px(1280.), height: px(800.) }, cx)),
+        ..WindowOptions::default()
+    };
+    cx.open_window(options, move |_window, cx| cx.new(|cx| Shell::with_controller(controller, cx)))
         .map(|_| ())
+}
+
+/// Open the desktop workspace window.
+pub fn open_shell_window(cx: &mut App) -> gpui::Result<()> {
+    let controller = AppController::open_from_environment();
+    open_workspace_window(cx, controller)
 }
 /// Start the native GPUI application.
 pub fn launch() {
     Application::new().run(|cx: &mut App| {
-        if let Err(e) = open_shell_window(cx) {
+        let controller = AppController::open_from_environment();
+        let result = if controller.vault.is_some() {
+            open_workspace_window(cx, controller)
+        } else {
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::centered(Size { width: px(800.), height: px(600.) }, cx)),
+                ..WindowOptions::default()
+            };
+            cx.open_window(options, |_window, cx| cx.new(Launcher::new)).map(|_| ())
+        };
+        if let Err(e) = result {
             eprintln!("failed to open Tachylyte window: {e}");
         }
     });
