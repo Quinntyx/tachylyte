@@ -70,6 +70,11 @@ impl SelectionModel {
             PaneAction::Home => self.selected = 0,
             PaneAction::End => self.selected = count.saturating_sub(1),
             PaneAction::Activate => {
+                self.selected = if count == 0 {
+                    0
+                } else {
+                    self.selected.min(count - 1)
+                };
                 if count > 0 {
                     self.activate_at(self.selected, selected_id(self.selected));
                     return;
