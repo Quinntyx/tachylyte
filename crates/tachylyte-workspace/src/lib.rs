@@ -9,6 +9,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+mod api;
+mod history;
+mod view_types;
+
+pub use api::*;
+pub use history::{ClosedTabStack, NavigationHistory};
+pub use view_types::{ViewDescriptor, ViewKind};
+
 pub type Id = String;
 
 fn id() -> Id {
@@ -22,6 +30,15 @@ pub struct ExtraFields(pub BTreeMap<String, Value>);
 pub enum Orientation {
     Horizontal,
     Vertical,
+}
+
+impl From<SplitOrientation> for Orientation {
+    fn from(value: SplitOrientation) -> Self {
+        match value {
+            SplitOrientation::Horizontal => Self::Horizontal,
+            SplitOrientation::Vertical => Self::Vertical,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -50,6 +67,10 @@ pub struct TabGroup {
 pub struct Tab {
     pub id: Id,
     pub view: View,
+    /// Per-leaf navigation state.  The current view is mirrored in `view` so
+    /// existing adapters can continue to render the compact tab model.
+    #[serde(default)]
+    pub history: NavigationHistory<View>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -61,6 +82,8 @@ pub struct Tab {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct View {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(default)]
     pub state: Value,
     #[serde(default)]
@@ -71,7 +94,35 @@ impl View {
     pub fn new(kind: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
+            path: None,
             state: Value::Null,
+            extras: ExtraFields::default(),
+        }
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_state(mut self, state: Value) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn descriptor(&self) -> ViewDescriptor {
+        ViewDescriptor {
+            kind: ViewKind::from(self.kind.clone()),
+            path: self.path.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    pub fn from_descriptor(descriptor: ViewDescriptor) -> Self {
+        Self {
+            kind: descriptor.kind.to_kind_string(),
+            path: descriptor.path,
+            state: descriptor.state,
             extras: ExtraFields::default(),
         }
     }
@@ -237,6 +288,9 @@ pub struct Workspace {
     pub windows: Vec<Window>,
     pub focused: Option<(Id, Id)>,
     pub mru: Vec<Id>,
+    /// Most recently closed leaves, retained for an Obsidian-style reopen.
+    #[serde(default)]
+    pub closed: ClosedTabStack<Tab>,
     pub ribbons: Vec<RibbonItem>,
     pub sidebar: Vec<SidebarTab>,
     pub status: Vec<StatusItem>,
@@ -279,6 +333,7 @@ impl Default for Workspace {
             }],
             focused: None,
             mru: vec![],
+            closed: ClosedTabStack::default(),
             ribbons: vec![],
             sidebar: vec![],
             status: vec![],
@@ -308,16 +363,75 @@ impl Default for Workspace {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    Open { window: Option<Id>, view: View },
-    Close { tab: Id },
-    Split { tab: Id, orientation: Orientation },
-    Move { tab: Id, target_group: Id },
-    Dock { tab: Id, target: DockTarget },
-    Focus { tab: Id },
-    Pin { tab: Id, pinned: bool },
-    Stack { group: Id, stacked: bool },
-    Popout { tab: Id },
-    SetFeature { feature: String, enabled: bool },
+    Open {
+        window: Option<Id>,
+        view: View,
+    },
+    /// Open a view in the selected group, optionally forcing a new tab.
+    OpenWith {
+        window: Option<Id>,
+        view: View,
+        new_tab: bool,
+    },
+    /// Open a path-backed view, reusing an existing matching tab unless forced.
+    OpenPath {
+        window: Option<Id>,
+        path: String,
+        new_tab: bool,
+    },
+    Close {
+        tab: Id,
+    },
+    CloseScope {
+        tab: Id,
+        scope: CloseScope,
+    },
+    Reorder {
+        tab: Id,
+        index: usize,
+    },
+    Split {
+        tab: Id,
+        orientation: Orientation,
+    },
+    Move {
+        tab: Id,
+        target_group: Id,
+    },
+    Duplicate {
+        tab: Id,
+    },
+    Navigate {
+        tab: Id,
+        view: View,
+    },
+    History {
+        tab: Id,
+        direction: HistoryCommand,
+    },
+    ReopenClosed,
+    Dock {
+        tab: Id,
+        target: DockTarget,
+    },
+    Focus {
+        tab: Id,
+    },
+    Pin {
+        tab: Id,
+        pinned: bool,
+    },
+    Stack {
+        group: Id,
+        stacked: bool,
+    },
+    Popout {
+        tab: Id,
+    },
+    SetFeature {
+        feature: String,
+        enabled: bool,
+    },
     RegisterCommand(Command),
     InvokeCommand(String),
     Hotkey(KeyChord),
@@ -338,6 +452,368 @@ pub enum Effect {
 }
 
 impl Workspace {
+    /// Open a view using the default reuse behavior.
+    pub fn open(&mut self, view: View) -> Id {
+        self.dispatch(Action::OpenWith {
+            window: None,
+            view,
+            new_tab: false,
+        });
+        self.focused_tab_id().unwrap_or_default()
+    }
+
+    /// Open a view, with `new_tab` representing the modifier-key behavior.
+    pub fn open_with_modifier(&mut self, view: View, new_tab: bool) -> Id {
+        self.dispatch(Action::OpenWith {
+            window: None,
+            view,
+            new_tab,
+        });
+        self.focused_tab_id().unwrap_or_default()
+    }
+
+    /// Open a markdown path, reusing the selected leaf unless forced new.
+    pub fn open_reusable_path(&mut self, path: impl Into<String>) -> Id {
+        let path = path.into();
+        if let Some((window, tab)) = self.windows.iter().find_map(|w| {
+            find_tab_with_path(&w.root, &path).map(|tab| (w.id.clone(), tab.id.clone()))
+        }) {
+            self.focus(&tab);
+            self.focused = Some((window, tab.clone()));
+            return tab;
+        }
+        self.open_with_modifier(
+            View {
+                kind: "markdown".into(),
+                path: Some(path),
+                state: Value::Null,
+                extras: ExtraFields::default(),
+            },
+            false,
+        )
+    }
+
+    pub fn close(&mut self, tab: &str) {
+        self.dispatch(Action::Close { tab: tab.into() });
+    }
+
+    pub fn close_others(&mut self, tab: &str) {
+        self.dispatch(Action::CloseScope {
+            tab: tab.into(),
+            scope: CloseScope::Others,
+        });
+    }
+
+    pub fn close_right(&mut self, tab: &str) {
+        self.dispatch(Action::CloseScope {
+            tab: tab.into(),
+            scope: CloseScope::ToRight,
+        });
+    }
+
+    pub fn reorder(&mut self, tab: &str, index: usize) {
+        self.dispatch(Action::Reorder {
+            tab: tab.into(),
+            index,
+        });
+    }
+
+    pub fn split(&mut self, tab: &str, orientation: Orientation) {
+        self.dispatch(Action::Split {
+            tab: tab.into(),
+            orientation,
+        });
+    }
+
+    pub fn move_to_group(&mut self, tab: &str, target_group: &str) {
+        self.dispatch(Action::Move {
+            tab: tab.into(),
+            target_group: target_group.into(),
+        });
+    }
+
+    pub fn pin(&mut self, tab: &str, pinned: bool) {
+        self.dispatch(Action::Pin {
+            tab: tab.into(),
+            pinned,
+        });
+    }
+
+    pub fn duplicate(&mut self, tab: &str) -> Id {
+        self.dispatch(Action::Duplicate { tab: tab.into() });
+        self.focused_tab_id().unwrap_or_default()
+    }
+
+    pub fn back(&mut self) {
+        if let Some(tab) = self.focused_tab_id() {
+            self.dispatch(Action::History {
+                tab,
+                direction: HistoryCommand::Back,
+            });
+        }
+    }
+
+    pub fn navigate(&mut self, tab: &str, view: View) {
+        self.dispatch(Action::Navigate {
+            tab: tab.into(),
+            view,
+        });
+    }
+
+    pub fn forward(&mut self) {
+        if let Some(tab) = self.focused_tab_id() {
+            self.dispatch(Action::History {
+                tab,
+                direction: HistoryCommand::Forward,
+            });
+        }
+    }
+
+    pub fn reopen_last_closed(&mut self) -> Option<Id> {
+        let before = self.closed.len();
+        self.dispatch(Action::ReopenClosed);
+        (self.closed.len() < before)
+            .then(|| self.focused_tab_id())
+            .flatten()
+    }
+
+    pub fn focused_tab_id(&self) -> Option<Id> {
+        self.focused.as_ref().map(|(_, tab)| tab.clone())
+    }
+
+    pub fn active_group_id(&self) -> Option<Id> {
+        let (window, tab) = self.focused.as_ref()?;
+        self.windows
+            .iter()
+            .find(|item| &item.id == window)
+            .and_then(|item| group_id_for_tab(&item.root, tab))
+    }
+
+    pub fn view_kinds(&self) -> &BTreeSet<String> {
+        &self.view_kinds
+    }
+
+    fn open_view(
+        &mut self,
+        window_id: Option<&str>,
+        view: View,
+        new_tab: bool,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(id) = window_id {
+            if !self.windows.iter().any(|window| window.id == id) {
+                effects.push(Effect::Error(format!("unknown window: {id}")));
+                return;
+            }
+        }
+        if !self.view_kinds.is_empty()
+            && !self.view_kinds.contains(&view.kind)
+            && !is_builtin_view_kind(&view.kind)
+        {
+            effects.push(Effect::UnknownView(view.kind));
+            return;
+        }
+        if self.features.get(&view.kind).copied() == Some(false) {
+            effects.push(Effect::Error(format!("feature disabled: {}", view.kind)));
+            return;
+        }
+        if is_builtin_view_kind(&view.kind) {
+            self.view_kinds.insert(view.kind.clone());
+        }
+        if !new_tab {
+            if let Some((window, tab)) = self.windows.iter().find_map(|window| {
+                find_tab_with_view(&window.root, &view)
+                    .map(|tab| (window.id.clone(), tab.id.clone()))
+            }) {
+                self.focus(&tab);
+                self.focused = Some((window, tab));
+                return;
+            }
+        }
+        let selected = self.focused.as_ref().map(|(_, tab)| tab.clone());
+        let target_window = window_id
+            .and_then(|id| self.windows.iter().position(|w| w.id == id))
+            .or_else(|| {
+                self.focused
+                    .as_ref()
+                    .and_then(|(id, _)| self.windows.iter().position(|w| &w.id == id))
+            })
+            .unwrap_or(0);
+        let Some(window) = self.windows.get_mut(target_window) else {
+            effects.push(Effect::Error("workspace has no window".into()));
+            return;
+        };
+        let target = selected
+            .as_deref()
+            .and_then(|tab| group_id_for_tab(&window.root, tab))
+            .or_else(|| first_group_id(&window.root));
+        let Some(group_id) = target else {
+            effects.push(Effect::Error("workspace has no tab group".into()));
+            return;
+        };
+        let group = find_group_mut(&mut window.root, &group_id).expect("group just found");
+        let mut history = NavigationHistory::default();
+        history.visit(view.clone());
+        let tab = Tab {
+            id: id(),
+            view,
+            history,
+            pinned: false,
+            title: None,
+            extras: ExtraFields::default(),
+        };
+        let tab_id = tab.id.clone();
+        group.tabs.push(tab);
+        group.active = group.tabs.len() - 1;
+        self.focused = Some((window.id.clone(), tab_id.clone()));
+        self.mru.retain(|x| x != &tab_id);
+        self.mru.insert(0, tab_id);
+    }
+
+    fn close_scope(&mut self, tab: &str, scope: CloseScope) {
+        let Some((window_id, group_id, index)) = self.tab_location(tab) else {
+            return;
+        };
+        let ids: Vec<Id> = {
+            let window = self.windows.iter().find(|w| w.id == window_id).unwrap();
+            let group = find_group(&window.root, &group_id).unwrap();
+            match scope {
+                CloseScope::Single => vec![tab.into()],
+                CloseScope::Others => group
+                    .tabs
+                    .iter()
+                    .filter(|item| item.id != tab && !item.pinned)
+                    .map(|item| item.id.clone())
+                    .collect(),
+                CloseScope::ToRight => group
+                    .tabs
+                    .iter()
+                    .skip(index + 1)
+                    .filter(|item| !item.pinned)
+                    .map(|item| item.id.clone())
+                    .collect(),
+            }
+        };
+        for id in ids {
+            self.remove_tab(&id);
+        }
+    }
+
+    fn reorder_tab(&mut self, tab: &str, index: usize) {
+        let Some((_, group_id, _)) = self.tab_location(tab) else {
+            return;
+        };
+        let Some(group) = self.find_group_mut(&group_id) else {
+            return;
+        };
+        let Some(from) = group.tabs.iter().position(|item| item.id == tab) else {
+            return;
+        };
+        let item = group.tabs.remove(from);
+        let pinned = item.pinned;
+        let first_unpinned = group
+            .tabs
+            .iter()
+            .position(|candidate| !candidate.pinned)
+            .unwrap_or(group.tabs.len());
+        let target = if pinned {
+            index.min(first_unpinned)
+        } else {
+            index.max(first_unpinned).min(group.tabs.len())
+        };
+        group.tabs.insert(target, item);
+        group.active = target;
+    }
+
+    fn set_pinned(&mut self, tab: &str, pinned: bool) {
+        let Some((window_id, group_id, index)) = self.tab_location(tab) else {
+            return;
+        };
+        let Some(window) = self.windows.iter_mut().find(|item| item.id == window_id) else {
+            return;
+        };
+        let Some(group) = find_group_mut(&mut window.root, &group_id) else {
+            return;
+        };
+        let mut item = group.tabs.remove(index);
+        item.pinned = pinned;
+        let target = if pinned {
+            group
+                .tabs
+                .iter()
+                .position(|candidate| !candidate.pinned)
+                .unwrap_or(group.tabs.len())
+        } else {
+            group.tabs.len()
+        };
+        let item_id = item.id.clone();
+        group.tabs.insert(target, item);
+        group.active = target;
+        self.focused = Some((window_id, item_id));
+    }
+
+    fn duplicate_tab(&mut self, tab: &str) {
+        let Some((window_id, group_id, index)) = self.tab_location(tab) else {
+            return;
+        };
+        let Some(window) = self.windows.iter_mut().find(|w| w.id == window_id) else {
+            return;
+        };
+        let Some(group) = find_group_mut(&mut window.root, &group_id) else {
+            return;
+        };
+        let Some(mut duplicate) = group.tabs.get(index).cloned() else {
+            return;
+        };
+        duplicate.id = id();
+        duplicate.pinned = false;
+        let duplicate_id = duplicate.id.clone();
+        group.tabs.insert(index + 1, duplicate);
+        group.active = index + 1;
+        self.focused = Some((window_id, duplicate_id.clone()));
+        self.mru.retain(|x| x != &duplicate_id);
+        self.mru.insert(0, duplicate_id);
+    }
+
+    fn reopen_last_closed_internal(&mut self) {
+        let Some(tab) = self.closed.reopen() else {
+            return;
+        };
+        let target_window = self
+            .focused
+            .as_ref()
+            .and_then(|(window, _)| self.windows.iter().position(|item| &item.id == window))
+            .unwrap_or(0);
+        let Some(window) = self.windows.get_mut(target_window) else {
+            return;
+        };
+        let Some(group_id) = self
+            .focused
+            .as_ref()
+            .and_then(|(_, id)| group_id_for_tab(&window.root, id))
+            .or_else(|| first_group_id(&window.root))
+        else {
+            return;
+        };
+        let group = find_group_mut(&mut window.root, &group_id).unwrap();
+        let tab_id = tab.id.clone();
+        let pinned = tab.pinned;
+        group.tabs.push(tab);
+        group.active = group.tabs.len() - 1;
+        self.focused = Some((window.id.clone(), tab_id.clone()));
+        self.mru.insert(0, tab_id);
+        if pinned {
+            self.set_pinned(self.focused_tab_id().as_deref().unwrap_or_default(), true);
+        }
+    }
+
+    fn tab_location(&self, tab: &str) -> Option<(Id, Id, usize)> {
+        self.windows.iter().find_map(|window| {
+            find_group_location(&window.root, tab)
+                .map(|(group, index)| (window.id.clone(), group, index))
+        })
+    }
+
     pub fn dispatch(&mut self, action: Action) -> Vec<Effect> {
         let mut effects = Vec::new();
         // Focus is observational: an invalid target must be a strict no-op.
@@ -350,13 +826,25 @@ impl Workspace {
         }
         match action {
             Action::Open { window, view } => {
-                if !self.view_kinds.is_empty() && !self.view_kinds.contains(&view.kind) {
+                if let Some(window_id) = window.as_ref() {
+                    if !self.windows.iter().any(|item| &item.id == window_id) {
+                        effects.push(Effect::Error(format!("unknown window: {window_id}")));
+                        return effects;
+                    }
+                }
+                if !self.view_kinds.is_empty()
+                    && !self.view_kinds.contains(&view.kind)
+                    && !is_builtin_view_kind(&view.kind)
+                {
                     effects.push(Effect::UnknownView(view.kind.clone()));
                     return effects;
                 }
                 if self.features.get(&view.kind).copied() == Some(false) {
                     effects.push(Effect::Error(format!("feature disabled: {}", view.kind)));
                     return effects;
+                }
+                if is_builtin_view_kind(&view.kind) {
+                    self.view_kinds.insert(view.kind.clone());
                 }
                 let index = match window {
                     Some(x) => match self.windows.iter().position(|w| w.id == x) {
@@ -372,6 +860,11 @@ impl Workspace {
                     if let LayoutNode::Tabs(g) = &mut w.root {
                         g.tabs.push(Tab {
                             id: id(),
+                            history: {
+                                let mut history = NavigationHistory::default();
+                                history.visit(view.clone());
+                                history
+                            },
                             view,
                             pinned: false,
                             title: None,
@@ -381,8 +874,30 @@ impl Workspace {
                     }
                 }
             }
+            Action::OpenWith {
+                window,
+                view,
+                new_tab,
+            } => {
+                self.open_view(window.as_deref(), view, new_tab, &mut effects);
+            }
+            Action::OpenPath {
+                window,
+                path,
+                new_tab,
+            } => {
+                let mut view = View::new("markdown");
+                view.path = Some(path);
+                self.open_view(window.as_deref(), view, new_tab, &mut effects);
+            }
             Action::Close { tab } => {
                 self.remove_tab(&tab);
+            }
+            Action::CloseScope { tab, scope } => {
+                self.close_scope(&tab, scope);
+            }
+            Action::Reorder { tab, index } => {
+                self.reorder_tab(&tab, index);
             }
             Action::Split { tab, orientation } => {
                 if tab.is_empty() || !self.split_tab(&tab, orientation) {
@@ -393,6 +908,29 @@ impl Workspace {
             }
             Action::Move { tab, target_group } => {
                 self.move_tab(&tab, &target_group);
+            }
+            Action::Duplicate { tab } => {
+                self.duplicate_tab(&tab);
+            }
+            Action::Navigate { tab, view } => {
+                if let Some(t) = self.find_tab_mut(&tab) {
+                    t.history.visit(view.clone());
+                    t.view = view;
+                }
+            }
+            Action::History { tab, direction } => {
+                if let Some(t) = self.find_tab_mut(&tab) {
+                    let view = match direction {
+                        HistoryCommand::Back => t.history.back(),
+                        HistoryCommand::Forward => t.history.forward(),
+                    };
+                    if let Some(view) = view {
+                        t.view = view;
+                    }
+                }
+            }
+            Action::ReopenClosed => {
+                self.reopen_last_closed_internal();
             }
             Action::Dock { tab, target } => match target {
                 DockTarget::Group(group) => {
@@ -459,9 +997,7 @@ impl Workspace {
                 }
             }
             Action::Pin { tab, pinned } => {
-                if let Some(t) = self.find_tab_mut(&tab) {
-                    t.pinned = pinned;
-                }
+                self.set_pinned(&tab, pinned);
             }
             Action::Stack { group, stacked } => {
                 if let Some(g) = self.find_group_mut(&group) {
@@ -602,9 +1138,12 @@ impl Workspace {
             self.focused = None;
         }
     }
-    fn focus(&mut self, tab: &str) {
+    pub fn focus(&mut self, tab: &str) {
         if self.find_tab(tab).is_some() {
             self.focused = self.find_tab(tab).map(|(w, _)| (w.id.clone(), tab.into()));
+            for window in &mut self.windows {
+                set_group_active(&mut window.root, tab);
+            }
             self.mru.retain(|x| x != tab);
             self.mru.insert(0, tab.into());
         }
@@ -642,8 +1181,12 @@ impl Workspace {
     }
     fn remove_tab(&mut self, tab: &str) {
         let was_focused = self.focused.as_ref().is_some_and(|(_, t)| t == tab);
-        let removed = self.take_tab(tab).is_some();
-        if removed && was_focused {
+        let removed = self.take_tab(tab);
+        let did_remove = removed.is_some();
+        if let Some(removed) = removed {
+            self.closed.push_closed(removed);
+        }
+        if did_remove && was_focused {
             self.normalize();
             if let Some(next) = self.mru.first().cloned().or_else(|| {
                 self.windows
@@ -665,8 +1208,10 @@ impl Workspace {
             None => return false,
         };
         if let Some(g) = self.find_group_mut(group) {
+            let moved_id = t.id.clone();
             g.tabs.push(t);
             g.active = g.tabs.len() - 1;
+            self.focus(&moved_id);
             true
         } else {
             false
@@ -774,6 +1319,85 @@ fn find_group<'a>(n: &'a LayoutNode, id: &str) -> Option<&'a TabGroup> {
             find_group(first, id).or_else(|| find_group(second, id))
         }
     }
+}
+
+fn first_group_id(n: &LayoutNode) -> Option<Id> {
+    match n {
+        LayoutNode::Tabs(group) => Some(group.id.clone()),
+        LayoutNode::Split { first, second, .. } => {
+            first_group_id(first).or_else(|| first_group_id(second))
+        }
+    }
+}
+
+fn group_id_for_tab(n: &LayoutNode, tab: &str) -> Option<Id> {
+    match n {
+        LayoutNode::Tabs(group) => group
+            .tabs
+            .iter()
+            .any(|item| item.id == tab)
+            .then(|| group.id.clone()),
+        LayoutNode::Split { first, second, .. } => {
+            group_id_for_tab(first, tab).or_else(|| group_id_for_tab(second, tab))
+        }
+    }
+}
+
+fn find_group_location(n: &LayoutNode, tab: &str) -> Option<(Id, usize)> {
+    match n {
+        LayoutNode::Tabs(group) => group
+            .tabs
+            .iter()
+            .position(|item| item.id == tab)
+            .map(|index| (group.id.clone(), index)),
+        LayoutNode::Split { first, second, .. } => {
+            find_group_location(first, tab).or_else(|| find_group_location(second, tab))
+        }
+    }
+}
+
+fn find_tab_with_path<'a>(n: &'a LayoutNode, path: &str) -> Option<&'a Tab> {
+    match n {
+        LayoutNode::Tabs(group) => group
+            .tabs
+            .iter()
+            .find(|tab| tab.view.path.as_deref() == Some(path)),
+        LayoutNode::Split { first, second, .. } => {
+            find_tab_with_path(first, path).or_else(|| find_tab_with_path(second, path))
+        }
+    }
+}
+
+fn find_tab_with_view<'a>(n: &'a LayoutNode, view: &View) -> Option<&'a Tab> {
+    match n {
+        LayoutNode::Tabs(group) => group
+            .tabs
+            .iter()
+            .find(|tab| tab.view.kind == view.kind && tab.view.path == view.path),
+        LayoutNode::Split { first, second, .. } => {
+            find_tab_with_view(first, view).or_else(|| find_tab_with_view(second, view))
+        }
+    }
+}
+
+fn set_group_active(n: &mut LayoutNode, tab: &str) -> bool {
+    match n {
+        LayoutNode::Tabs(group) => {
+            if let Some(index) = group.tabs.iter().position(|item| item.id == tab) {
+                group.active = index;
+                true
+            } else {
+                false
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            set_group_active(first, tab) || set_group_active(second, tab)
+        }
+    }
+}
+
+fn is_builtin_view_kind(kind: &str) -> bool {
+    matches!(kind, "markdown" | "graph" | "settings" | "media")
 }
 fn tab_ids(n: &LayoutNode) -> Vec<Id> {
     match n {
