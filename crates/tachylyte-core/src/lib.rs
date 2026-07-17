@@ -5,11 +5,14 @@
 
 #[cfg(target_os = "linux")]
 use rustix::fs::{
-    fsync, mkdirat, openat, openat2, renameat, renameat_with, unlinkat, AtFlags, Mode, OFlags,
-    RenameFlags, ResolveFlags, CWD,
+    fsync, mkdirat, openat, openat2, renameat, renameat_with, statat, unlinkat, AtFlags, Dir, Mode,
+    OFlags, RenameFlags, ResolveFlags, CWD,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::{
@@ -211,8 +214,28 @@ impl Vault {
     }
     /// Read UTF-8 bytes from a vault file.
     pub fn read(&self, path: &VaultPath) -> Result<Vec<u8>, CoreError> {
-        let p = self.checked(path, false)?;
-        fs::read(&p).map_err(|e| io_at(&p, e))
+        #[cfg(target_os = "linux")]
+        {
+            let p = self.root.join(path.as_path());
+            let (dir, name) = linux_parent(self, path)?;
+            let fd = openat2(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(|e| io_at(&p, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            let mut file = fs::File::from(fd);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| io_at(&p, e))?;
+            Ok(bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let p = self.checked(path, false)?;
+            return fs::read(&p).map_err(|e| io_at(&p, e));
+        }
     }
     /// Atomically replace a file, refusing symlink targets and creating parents.
     pub fn write(&self, path: &VaultPath, data: &[u8]) -> Result<(), CoreError> {
@@ -529,12 +552,67 @@ impl Vault {
     }
     /// Scan supported Obsidian files, excluding hidden directories and `.trash`.
     pub fn scan(&self) -> Result<Vec<VaultEntry>, CoreError> {
-        let mut out = Vec::new();
-        scan_dir(&self.root, &self.root, &mut out)?;
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
+        #[cfg(target_os = "linux")]
+        {
+            let mut out = Vec::new();
+            linux_scan_dir(&self.root_cap, Path::new(""), &mut out)?;
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut out = Vec::new();
+            scan_dir(&self.root, &self.root, &mut out)?;
+            out.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(out)
+        }
     }
 }
+#[cfg(target_os = "linux")]
+fn linux_scan_dir(
+    fd: &std::sync::Arc<fs::File>,
+    relative: &Path,
+    out: &mut Vec<VaultEntry>,
+) -> Result<(), CoreError> {
+    let mut entries = Dir::read_from(&**fd)
+        .map_err(|e| io_at(relative, io::Error::from_raw_os_error(e.raw_os_error())))?;
+    while let Some(entry) = entries.read() {
+        let entry =
+            entry.map_err(|e| io_at(relative, io::Error::from_raw_os_error(e.raw_os_error())))?;
+        let name = entry.file_name();
+        if name.to_bytes().first() == Some(&b'.') {
+            continue;
+        }
+        let child_name = std::ffi::OsStr::from_bytes(name.to_bytes());
+        let child = if relative.as_os_str().is_empty() {
+            PathBuf::from(child_name)
+        } else {
+            relative.join(child_name)
+        };
+        let child_fd = openat2(
+            &**fd,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        );
+        if let Ok(child_fd) = child_fd {
+            linux_scan_dir(&std::sync::Arc::new(fs::File::from(child_fd)), &child, out)?;
+            continue;
+        }
+        let stat = statat(&**fd, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|e| io_at(&child, io::Error::from_raw_os_error(e.raw_os_error())))?;
+        if let Some(kind) = FileKind::from_path(&child) {
+            out.push(VaultEntry {
+                path: VaultPath::new(&child)?,
+                kind,
+                size: stat.st_size as u64,
+            });
+        }
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
 fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<VaultEntry>) -> Result<(), CoreError> {
     for e in fs::read_dir(dir).map_err(|x| io_at(dir, x))? {
         let e = e.map_err(|x| io_at(dir, x))?;
@@ -1030,5 +1108,17 @@ mod tests {
             .unwrap();
         assert!(!outside.path().join("safe.md").exists());
         assert!(moved.join("safe.md").exists());
+        fs::write(outside.path().join("replacement.md"), b"outside").unwrap();
+        assert_eq!(
+            vault.read(&VaultPath::new("safe.md").unwrap()).unwrap(),
+            b"inside"
+        );
+        let scanned = vault.scan().unwrap();
+        assert!(scanned
+            .iter()
+            .any(|entry| entry.path.as_path() == Path::new("safe.md")));
+        assert!(!scanned
+            .iter()
+            .any(|entry| entry.path.as_path() == Path::new("replacement.md")));
     }
 }
