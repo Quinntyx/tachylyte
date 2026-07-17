@@ -1,17 +1,21 @@
 //! GPUI view for the neutral settings model.
 
 use crate::model::{Category, Settings, Theme};
-use gpui::{div, prelude::*, px, rgb, Context, Render, Window};
+use gpui::{div, prelude::*, px, rgb, Context, ElementId, FocusHandle, Render, Window};
 
 /// A mountable settings window.  State and events belong to [`Settings`], so a
 /// host can snapshot or drain them without depending on GPUI.
 pub struct SettingsWindow {
     pub model: Settings,
+    focus_handle: FocusHandle,
 }
 
 impl SettingsWindow {
-    pub fn new(model: Settings, _cx: &mut Context<Self>) -> Self {
-        Self { model }
+    pub fn new(model: Settings, cx: &mut Context<Self>) -> Self {
+        Self {
+            model,
+            focus_handle: cx.focus_handle(),
+        }
     }
 
     pub fn mount(model: Settings, cx: &mut Context<Self>) -> gpui::Entity<Self> {
@@ -45,14 +49,15 @@ fn toggle(
         .px_3()
         .py_2()
         .border_b_1()
-        .border_color(rgb(0xe0e0e0ff))
+        .border_color(rgb(0xe0e0e0))
         .child(label)
         .child(
             div()
+                .id(ElementId::Name(format!("toggle-control-{id}").into()))
                 .px_2()
                 .py_1()
-                .bg(rgb(if value { 0x7852eeff } else { 0xe0e0e0ff }))
-                .text_color(rgb(if value { 0xffffffff } else { 0x222222ff }))
+                .bg(rgb(if value { 0x7852ee } else { 0xe0e0e0 }))
+                .text_color(rgb(if value { 0xffffff } else { 0x222222 }))
                 .child(if value { "On" } else { "Off" })
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     target.update(cx, |window, cx| {
@@ -84,11 +89,11 @@ impl Render for SettingsWindow {
             let selected = item == category;
             let target = target.clone();
             div()
-                .id(item.label())
+                .id(ElementId::Name(format!("category-{}", item.label()).into()))
                 .px_3()
                 .py_2()
-                .text_color(rgb(if selected { 0x7852eeff } else { 0x222222ff }))
-                .bg(rgb(if selected { 0xf6f6f6ff } else { 0xffffff00 }))
+                .text_color(rgb(if selected { 0x7852ee } else { 0x222222 }))
+                .bg(rgb(if selected { 0xf6f6f6 } else { 0xffffff }))
                 .child(item.label())
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     target.update(cx, |w, cx| {
@@ -109,11 +114,16 @@ impl Render for SettingsWindow {
                         let active = self.model.theme == theme;
                         let target = target.clone();
                         div()
+                            .id(match theme {
+                                Theme::Light => "theme-light",
+                                Theme::System => "theme-system",
+                                Theme::Dark => "theme-dark",
+                            })
                             .px_3()
                             .py_2()
                             .border_1()
-                            .border_color(rgb(if active { 0x7852eeff } else { 0xe0e0e0ff }))
-                            .bg(rgb(if active { 0xf6f6f6ff } else { 0xffffffff }))
+                            .border_color(rgb(if active { 0x7852ee } else { 0xe0e0e0 }))
+                            .bg(rgb(if active { 0xf6f6f6 } else { 0xffffff }))
                             .child(format!("{:?}", theme))
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 target.update(cx, |w, cx| {
@@ -128,11 +138,12 @@ impl Render for SettingsWindow {
                     .child(div().flex().gap_2().mt_2().children(themes))
                     .child(
                         div()
+                            .id("accent-control")
                             .mt_4()
                             .px_3()
                             .py_2()
                             .border_1()
-                            .border_color(rgb(0xe0e0e0ff))
+                            .border_color(rgb(0xe0e0e0))
                             .child(format!("Accent: {}", self.model.accent))
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 accent_target.update(cx, |window, cx| {
@@ -206,7 +217,7 @@ impl Render for SettingsWindow {
                     div()
                         .py_2()
                         .border_b_1()
-                        .border_color(rgb(0xe0e0e0ff))
+                        .border_color(rgb(0xe0e0e0))
                         .child(format!(
                             "{}    {}",
                             h.label,
@@ -222,20 +233,22 @@ impl Render for SettingsWindow {
                         let enabled = p.enabled;
                         let target = target.clone();
                         div()
+                            .id(ElementId::Name(format!("plugin-{id}").into()))
                             .flex()
                             .items_center()
                             .justify_between()
                             .px_3()
                             .py_2()
                             .border_b_1()
-                            .border_color(rgb(0xe0e0e0ff))
+                            .border_color(rgb(0xe0e0e0))
                             .child(label)
                             .child(
                                 div()
+                                    .id(ElementId::Name(format!("plugin-toggle-{id}").into()))
                                     .px_2()
                                     .py_1()
-                                    .bg(rgb(if enabled { 0x7852eeff } else { 0xe0e0e0ff }))
-                                    .text_color(rgb(if enabled { 0xffffffff } else { 0x222222ff }))
+                                    .bg(rgb(if enabled { 0x7852ee } else { 0xe0e0e0 }))
+                                    .text_color(rgb(if enabled { 0xffffff } else { 0x222222 }))
                                     .child(if enabled { "On" } else { "Off" })
                                     .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                         target.update(cx, |w, cx| {
@@ -254,11 +267,15 @@ impl Render for SettingsWindow {
             .tab_index(0)
             .key_context("settings-search")
             .border_1()
-            .border_color(rgb(0xe0e0e0ff))
-            .bg(rgb(0xffffffff))
+            .border_color(rgb(0xe0e0e0))
+            .bg(rgb(0xffffff))
             .px_3()
             .py_2()
-            .text_color(rgb(0x222222ff))
+            .text_color(rgb(0x222222))
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let focus_handle = self.focus_handle.clone();
+                move |_, window, _| focus_handle.focus(window)
+            })
             .child(if search.is_empty() {
                 "⌕  Search settings".to_owned()
             } else {
@@ -273,7 +290,8 @@ impl Render for SettingsWindow {
                             .next_back()
                             .map_or_else(String::new, |(index, _)| current[..index].to_owned())
                     } else if let Some(character) = &event.keystroke.key_char {
-                        if !event.keystroke.modifiers.control
+                        if !character.chars().any(char::is_control)
+                            && !event.keystroke.modifiers.control
                             && !event.keystroke.modifiers.platform
                             && !event.keystroke.modifiers.alt
                         {
@@ -294,8 +312,8 @@ impl Render for SettingsWindow {
         div()
             .id("settings-window")
             .size_full()
-            .bg(rgb(0xffffffff))
-            .text_color(rgb(0x222222ff))
+            .bg(rgb(0xffffff))
+            .text_color(rgb(0x222222))
             .flex()
             .flex_col()
             .child(
@@ -306,29 +324,27 @@ impl Render for SettingsWindow {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0xe0e0e0ff))
+                    .border_color(rgb(0xe0e0e0))
                     .child("Settings")
-                    .child(div().px_2().py_1().child("Close").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            close_target.update(cx, |w, cx| {
-                                w.model.request_close();
-                                cx.notify();
-                            })
-                        },
-                    )),
+                    .child(
+                        div()
+                            .id("settings-close")
+                            .px_2()
+                            .py_1()
+                            .child("Close")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                close_target.update(cx, |w, cx| {
+                                    w.model.request_close();
+                                    cx.notify();
+                                })
+                            }),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .flex()
-                    .child(
-                        div()
-                            .w(px(190.))
-                            .bg(rgb(0xf6f6f6ff))
-                            .p_3()
-                            .children(sidebar),
-                    )
+                    .child(div().w(px(190.)).bg(rgb(0xf6f6f6)).p_3().children(sidebar))
                     .child(
                         div()
                             .flex_1()

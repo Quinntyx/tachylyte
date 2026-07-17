@@ -26,6 +26,36 @@ fn search_filters_plugins_case_insensitively() {
 }
 
 #[test]
+fn search_control_characters_are_ignored() {
+    let mut settings = Settings::default();
+
+    settings.set_search("graph\u{0000}");
+
+    assert_eq!(settings.search(), "graph");
+    assert_eq!(settings.filtered_plugins().len(), 1);
+    assert_eq!(
+        settings.drain_events(),
+        vec![SettingsEvent::SearchChanged("graph".into())]
+    );
+}
+
+#[test]
+fn draining_without_new_changes_is_stably_neutral() {
+    let mut settings = Settings::default();
+
+    assert!(settings.drain_events().is_empty());
+    settings.set_search("graph");
+    assert_eq!(
+        settings.drain_events(),
+        vec![SettingsEvent::SearchChanged("graph".into())]
+    );
+    assert!(settings.drain_events().is_empty());
+
+    settings.set_plugin_enabled("does-not-exist", false);
+    assert!(settings.drain_events().is_empty());
+}
+
+#[test]
 fn plugin_toggle_emits_a_neutral_event() {
     let mut settings = Settings::default();
 

@@ -221,7 +221,11 @@ impl Settings {
         self.events.push(SettingsEvent::AccentChanged(accent));
     }
     pub fn set_search<S: Into<String>>(&mut self, search: S) {
-        self.search = search.into();
+        self.search = search
+            .into()
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect();
         self.events
             .push(SettingsEvent::SearchChanged(self.search.clone()));
     }
@@ -330,5 +334,18 @@ mod tests {
             s.drain_events()[1],
             SettingsEvent::ThemeChanged(Theme::Dark)
         ));
+    }
+
+    #[test]
+    fn search_ignores_control_characters() {
+        let mut s = Settings::default();
+
+        s.set_search("gr\n\0ap\u{7}h");
+
+        assert_eq!(s.search(), "graph");
+        assert_eq!(
+            s.drain_events(),
+            vec![SettingsEvent::SearchChanged("graph".into())]
+        );
     }
 }

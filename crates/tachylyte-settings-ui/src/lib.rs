@@ -1,13 +1,20 @@
 //! Settings surface for Tachylyte applications.
 //!
 //! The crate provides a GPUI view for mounting a small, data-oriented settings
-//! model. Applications that do not render the settings window can use the
-//! model and its [`model::SettingsEvent`] values directly, while GPUI callers
-//! can mount [`SettingsWindow`] with [`SettingsWindow::mount`].
+//! model. A GPUI host creates an entity with [`SettingsWindow::mount`] and
+//! mounts that entity in its window; the window owns the model while it is
+//! displayed.
 //!
-//! The model event is re-exported as [`SettingsEvent`]. The view emits those
-//! same neutral events, allowing a host to reduce changes without coupling its
-//! persistence layer to GPUI.
+//! User interactions are recorded by the model as events. Hosts should call
+//! [`SettingsWindow::drain_events`] after updates to take the pending events
+//! and forward them to persistence or application state. The view uses stable
+//! element IDs for its interactive controls, and emits neutral model events
+//! rather than GPUI-specific events. This keeps event handling and persistence
+//! independent of the rendering layer.
+//!
+//! Applications that do not render the settings window can use the model and
+//! its [`model::SettingsEvent`] values directly. The model event is also
+//! re-exported as [`SettingsEvent`].
 
 mod model;
 mod view;
