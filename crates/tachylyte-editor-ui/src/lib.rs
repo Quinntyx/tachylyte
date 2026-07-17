@@ -5,8 +5,10 @@
 //! input. It never reads or writes files: consumers receive [`EditorEvent`]s.
 
 use gpui::{
-    div, prelude::*, App, Bounds, Context, EntityInputHandler, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, MouseButton, Pixels, Point, Render, UTF16Selection, Window,
+    div, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, Context, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, Pixels, Point, Render,
+    UTF16Selection, Window,
 };
 use std::ops::Range;
 use tachylyte_markdown::{EditorDocument, Span, ViewMode};
@@ -74,21 +76,30 @@ pub enum EditorEvent {
 #[derive(Clone, Debug)]
 pub struct EditorState {
     document: EditorDocument,
+    clean_source: String,
     selection: Selection,
     mode: ViewMode,
     scroll_line: usize,
     find_query: String,
     events: Vec<EditorEvent>,
+    history: Vec<(String, Selection)>,
+    redo_history: Vec<(String, Selection)>,
+    marked: Option<Range<usize>>,
 }
 impl EditorState {
     pub fn new(source: impl Into<String>) -> Self {
+        let source = source.into();
         Self {
-            document: EditorDocument::new(source),
+            document: EditorDocument::new(source.clone()),
+            clean_source: source,
             selection: Selection::default(),
             mode: ViewMode::Source,
             scroll_line: 0,
             find_query: String::new(),
             events: Vec::new(),
+            history: Vec::new(),
+            redo_history: Vec::new(),
+            marked: None,
         }
     }
     pub fn source(&self) -> &str {
@@ -104,7 +115,7 @@ impl EditorState {
         Cursor(self.selection.head.0)
     }
     pub fn is_dirty(&self) -> bool {
-        self.document.is_dirty()
+        self.source() != self.clean_source
     }
     pub fn mode(&self) -> ViewMode {
         self.mode
@@ -124,6 +135,18 @@ impl EditorState {
             head: cursor,
         };
     }
+    pub fn marked_range(&self) -> Option<Range<usize>> {
+        self.marked.clone()
+    }
+    pub fn set_marked_range(&mut self, range: Option<Range<usize>>) {
+        self.marked = range.map(|r| {
+            self.normalize(Selection {
+                anchor: Cursor(r.start),
+                head: Cursor(r.end),
+            })
+            .range()
+        });
+    }
     pub fn set_mode(&mut self, mode: ViewMode) {
         if self.mode != mode {
             self.mode = mode;
@@ -131,7 +154,7 @@ impl EditorState {
         }
     }
     pub fn mark_clean(&mut self) {
-        self.document.mark_clean();
+        self.clean_source = self.source().to_owned();
     }
     pub fn take_events(&mut self) -> Vec<EditorEvent> {
         std::mem::take(&mut self.events)
@@ -143,6 +166,9 @@ impl EditorState {
     }
     fn replace(&mut self, range: Range<usize>, text: &str) {
         let was_dirty = self.is_dirty();
+        let before = self.source().to_owned();
+        self.history.push((before, self.selection));
+        self.redo_history.clear();
         if self
             .document
             .edit(Span::new(range.start, range.end), text)
@@ -180,16 +206,26 @@ impl EditorState {
         }
     }
     pub fn undo(&mut self) {
-        if self.document.undo() {
-            self.set_cursor(Cursor(self.cursor().0.min(self.source().len())));
+        if let Some((source, selection)) = self.history.pop() {
+            self.redo_history
+                .push((self.source().to_owned(), self.selection));
+            self.document = EditorDocument::new(source);
+            if self.document.source() == self.document.source()
+                && self.document.source() != self.source()
+            { /* keep revisioned model */
+            }
+            self.selection = self.normalize(selection);
             self.events.push(EditorEvent::Changed {
                 revision: self.document.document().revision,
             });
         }
     }
     pub fn redo(&mut self) {
-        if self.document.redo() {
-            self.set_cursor(Cursor(self.cursor().0.min(self.source().len())));
+        if let Some((source, selection)) = self.redo_history.pop() {
+            self.history
+                .push((self.source().to_owned(), self.selection));
+            self.document = EditorDocument::new(source);
+            self.selection = self.normalize(selection);
             self.events.push(EditorEvent::Changed {
                 revision: self.document.document().revision,
             });
@@ -222,6 +258,31 @@ impl EditorState {
             }
         }
         out
+    }
+    pub fn replace_marked_text(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+    ) {
+        let target = range
+            .map(|r| utf16_to_byte_range(self.source(), r))
+            .or_else(|| self.marked.clone())
+            .unwrap_or_else(|| self.selection.range());
+        self.replace(target.clone(), text);
+        let start = target.start;
+        self.marked = Some(start..start + text.len());
+        if let Some(r) = selected {
+            let a = utf16_to_byte(self.source(), r.start);
+            let b = utf16_to_byte(self.source(), r.end);
+            self.set_selection(Selection {
+                anchor: Cursor(a),
+                head: Cursor(b),
+            });
+        }
+    }
+    pub fn unmark_text(&mut self) {
+        self.marked = None;
     }
     /// Projects source into lines and lightweight syntax spans.
     pub fn projection(&self) -> Vec<ProjectedLine> {
@@ -291,6 +352,89 @@ pub struct MarkdownEditor {
     scroll: gpui::ScrollHandle,
     pub accessibility_label: String,
 }
+
+/// Adds the GPUI 0.2.2 input protocol to an element during its paint phase.
+/// GPUI 0.2.2 exposes this as `Window::handle_input` rather than a built-in
+/// fluent method; this extension keeps the call site component-friendly.
+pub trait InputHandlerElementExt {
+    fn input_handler(self, focus: &FocusHandle, view: Entity<MarkdownEditor>) -> InputElement;
+}
+pub struct InputElement {
+    child: AnyElement,
+    focus: FocusHandle,
+    view: Entity<MarkdownEditor>,
+}
+impl InputHandlerElementExt for gpui::Div {
+    fn input_handler(self, focus: &FocusHandle, view: Entity<MarkdownEditor>) -> InputElement {
+        InputElement {
+            child: self.into_any_element(),
+            focus: focus.clone(),
+            view,
+        }
+    }
+}
+impl InputHandlerElementExt for gpui::Stateful<gpui::Div> {
+    fn input_handler(self, focus: &FocusHandle, view: Entity<MarkdownEditor>) -> InputElement {
+        InputElement {
+            child: self.into_any_element(),
+            focus: focus.clone(),
+            view,
+        }
+    }
+}
+impl IntoElement for InputElement {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+impl Element for InputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.prepaint(window, cx);
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.handle_input(
+            &self.focus,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
+        self.child.paint(window, cx);
+    }
+}
 impl MarkdownEditor {
     pub fn new(source: impl Into<String>, cx: &mut Context<Self>) -> Self {
         Self {
@@ -318,11 +462,34 @@ impl Render for MarkdownEditor {
         let entity = _cx.entity();
         let key_entity = entity.clone();
         let mouse_focus = focus.clone();
-        let lines = self
-            .state
-            .projection()
-            .into_iter()
-            .map(|l| format!("{:>4}  {}", l.number, l.text));
+        let click_focus = focus.clone();
+        let selection = self.state.selection();
+        let cursor = self.state.cursor().0;
+        let lines = self.state.projection().into_iter().map(move |line| {
+            let mut children = Vec::new();
+            let selected = selection.range();
+            let line_end = line.span.end;
+            for (offset, ch) in line.text.char_indices() {
+                let start = line.span.start + offset;
+                if start == cursor {
+                    children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
+                }
+                let end = start + ch.len_utf8();
+                let style = if start < selected.end && end > selected.start {
+                    rgb(0x355070ff)
+                } else {
+                    rgb(0x20242bff)
+                };
+                children.push(div().bg(style).child(ch.to_string()));
+            }
+            if cursor == line_end {
+                children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
+            }
+            div()
+                .flex()
+                .child(format!("{:>4}  ", line.number))
+                .children(children)
+        });
         div()
             .id("markdown-editor")
             .track_focus(&focus)
@@ -331,12 +498,13 @@ impl Render for MarkdownEditor {
                 mouse_focus.focus(window);
             })
             .on_mouse_down(MouseButton::Left, move |_, window, _| {
-                focus.focus(window);
+                click_focus.focus(window);
             })
             .flex()
             .flex_col()
             .overflow_y_scroll()
             .child(div().children(lines))
+            .input_handler(&focus, entity)
     }
 }
 impl MarkdownEditor {
@@ -408,9 +576,13 @@ impl EntityInputHandler for MarkdownEditor {
         })
     }
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.state
+            .marked_range()
+            .map(|r| byte_to_utf16_range(self.state.source(), r))
     }
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.state.unmark_text();
+    }
     fn replace_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
@@ -418,13 +590,7 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
-        if let Some(r) = range {
-            self.state.set_selection(Selection {
-                anchor: Cursor(utf16_to_byte(self.state.source(), r.start)),
-                head: Cursor(utf16_to_byte(self.state.source(), r.end)),
-            })
-        }
-        self.state.insert_text(text)
+        self.state.replace_marked_text(range, text, None)
     }
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -434,42 +600,74 @@ impl EntityInputHandler for MarkdownEditor {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_text_in_range(range, text, w, cx);
-        if let Some(r) = new_selected {
-            let a = utf16_to_byte(self.state.source(), r.start);
-            self.state.set_cursor(Cursor(a));
-        }
+        let _ = (w, cx);
+        self.state.replace_marked_text(range, text, new_selected)
     }
     fn bounds_for_range(
         &mut self,
-        _: Range<usize>,
-        _: Bounds<Pixels>,
+        range: Range<usize>,
+        element_bounds: Bounds<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        None
+        let r = utf16_to_byte_range(self.state.source(), range);
+        let line = self.state.source()[..r.start]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        let line_start = self.state.source()[..r.start]
+            .rfind('\n')
+            .map_or(0, |p| p + 1);
+        let column = self.state.source()[line_start..r.start].chars().count();
+        Some(Bounds::new(
+            point(
+                element_bounds.origin.x + px(column as f32 * 8.0),
+                element_bounds.origin.y + px(line as f32 * 18.0),
+            ),
+            size(px(((r.end - r.start).max(1)) as f32 * 8.0), px(18.0)),
+        ))
     }
     fn character_index_for_point(
         &mut self,
-        _: Point<Pixels>,
+        point: Point<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.state.cursor().0)
+        let line = (f32::from(point.y) / 18.0).max(0.0) as usize;
+        let line_start = self
+            .state
+            .source()
+            .split_inclusive('\n')
+            .take(line)
+            .map(str::len)
+            .sum::<usize>();
+        let column = (f32::from(point.x) / 8.0).max(0.0) as usize;
+        Some(
+            line_start
+                + self.state.source()[line_start..]
+                    .chars()
+                    .take(column)
+                    .map(char::len_utf8)
+                    .sum::<usize>(),
+        )
     }
 }
 fn utf16_to_byte(s: &str, n: usize) -> usize {
-    s.char_indices()
-        .scan(0, |u, (i, c)| {
-            let out = (*u, i);
-            *u += c.len_utf16();
-            Some(out)
-        })
-        .find(|(u, _)| *u >= n)
-        .map_or(s.len(), |(_, i)| i)
+    let mut units = 0;
+    for (i, c) in s.char_indices() {
+        if n <= units {
+            return i;
+        }
+        units += c.len_utf16();
+        if n <= units {
+            return i + c.len_utf8();
+        }
+    }
+    s.len()
 }
 fn byte_to_utf16(s: &str, n: usize) -> usize {
-    s[..n.min(s.len())].encode_utf16().count()
+    let end = prev_boundary(s, n);
+    s[..end].encode_utf16().count()
 }
 fn utf16_to_byte_range(s: &str, r: Range<usize>) -> Range<usize> {
     utf16_to_byte(s, r.start)..utf16_to_byte(s, r.end)
@@ -508,5 +706,50 @@ mod tests {
         assert_eq!(e.find_results().len(), 2);
         assert_eq!(e.projection().len(), 2);
         assert_eq!(e.mode(), ViewMode::Reading);
+    }
+    #[test]
+    fn astral_utf16_ranges_are_character_safe() {
+        let source = "a🙂b";
+        assert_eq!(utf16_to_byte(source, 1), 1);
+        assert_eq!(utf16_to_byte(source, 3), 5);
+        assert_eq!(byte_to_utf16(source, 5), 3);
+        assert_eq!(utf16_to_byte_range(source, 1..3), 1..5);
+    }
+    #[test]
+    fn ime_composition_tracks_and_unmarks() {
+        let mut e = EditorState::new("ab");
+        e.set_cursor(Cursor(1));
+        e.replace_marked_text(None, "é", Some(1..2));
+        assert_eq!(e.source(), "aéb");
+        assert_eq!(e.marked_range(), Some(1..3));
+        assert_eq!(
+            e.selection(),
+            Selection {
+                anchor: Cursor(1),
+                head: Cursor(3)
+            }
+        );
+        e.unmark_text();
+        assert_eq!(e.marked_range(), None);
+    }
+    #[test]
+    fn undo_restores_selection_and_projection_spans() {
+        let mut e = EditorState::new("one\ntwo");
+        e.set_selection(Selection {
+            anchor: Cursor(1),
+            head: Cursor(3),
+        });
+        e.insert_text("X");
+        e.undo();
+        assert_eq!(
+            e.selection(),
+            Selection {
+                anchor: Cursor(1),
+                head: Cursor(3)
+            }
+        );
+        let lines = e.projection();
+        assert_eq!(lines[0].span, Span::new(0, 3));
+        assert_eq!(lines[1].span, Span::new(4, 7));
     }
 }
