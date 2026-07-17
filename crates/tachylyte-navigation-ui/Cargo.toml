@@ -8,3 +8,4 @@ license.workspace = true
 gpui.workspace = true
 tachylyte-core = { path = "../tachylyte-core" }
 tachylyte-knowledge = { path = "../tachylyte-knowledge" }
+unicode-normalization = "0.1"

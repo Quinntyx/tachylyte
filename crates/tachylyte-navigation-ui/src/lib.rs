@@ -6,11 +6,18 @@
 
 use gpui::{div, prelude::*, Context, Entity, Render, Window};
 use std::collections::{BTreeMap, BTreeSet};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 /// Unicode-friendly (case-insensitive) substring matching used by every pane.
 pub fn matches_filter(value: &str, filter: &str) -> bool {
-    let needle = filter.trim().to_lowercase();
-    needle.is_empty() || value.to_lowercase().contains(&needle)
+    let fold = |text: &str| {
+        text.nfkd()
+            .filter(|c| !is_combining_mark(*c))
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let needle = fold(filter.trim());
+    needle.is_empty() || fold(value).contains(&needle)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +36,7 @@ pub enum PaneAction {
     Home,
     End,
     Activate,
+    /// Toggle a row's collapsed state; the emitted boolean is `true` when now expanded.
     Toggle(String),
 }
 
@@ -41,6 +49,11 @@ pub struct SelectionModel {
     pub events: Vec<PaneEvent>,
 }
 impl SelectionModel {
+    pub fn activate_at(&mut self, index: usize, id: String) {
+        self.selected = index;
+        self.events.push(PaneEvent::Selected(id.clone()));
+        self.events.push(PaneEvent::Activated(id));
+    }
     pub fn reduce(
         &mut self,
         action: PaneAction,
@@ -58,8 +71,8 @@ impl SelectionModel {
             PaneAction::End => self.selected = count.saturating_sub(1),
             PaneAction::Activate => {
                 if count > 0 {
-                    self.events
-                        .push(PaneEvent::Activated(selected_id(self.selected)));
+                    self.activate_at(self.selected, selected_id(self.selected));
+                    return;
                 }
             }
             PaneAction::Toggle(id) => {
@@ -96,6 +109,9 @@ pub struct FileExplorerModel {
 }
 impl FileExplorerModel {
     pub fn visible(&self) -> Vec<&FileNode> {
+        if !self.feature_enabled {
+            return Vec::new();
+        }
         flatten_nodes(&self.nodes, &self.state.collapsed, &self.state.filter)
     }
     pub fn reduce(&mut self, action: PaneAction) {
@@ -109,16 +125,33 @@ fn flatten_nodes<'a>(
     collapsed: &BTreeSet<String>,
     filter: &str,
 ) -> Vec<&'a FileNode> {
-    let mut out = Vec::new();
-    for node in nodes {
-        if matches_filter(&node.label, filter) {
-            out.push(node);
+    fn visit<'a>(
+        node: &'a FileNode,
+        collapsed: &BTreeSet<String>,
+        filter: &str,
+    ) -> (bool, Vec<&'a FileNode>) {
+        let direct = matches_filter(&node.label, filter);
+        let reveal = !filter.trim().is_empty();
+        let children = if node.folder && (!collapsed.contains(&node.id) || reveal) {
+            node.children
+                .iter()
+                .map(|child| visit(child, collapsed, filter))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let descendant = children.iter().any(|(matched, _)| *matched);
+        let matched = direct || descendant;
+        let mut out = if matched { vec![node] } else { Vec::new() };
+        for (_, child_rows) in children {
+            out.extend(child_rows);
         }
-        if node.folder && !collapsed.contains(&node.id) {
-            out.extend(flatten_nodes(&node.children, collapsed, filter));
-        }
+        (matched, out)
     }
-    out
+    nodes
+        .iter()
+        .flat_map(|node| visit(node, collapsed, filter).1)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +168,9 @@ pub struct SearchResultsModel {
 }
 impl SearchResultsModel {
     pub fn visible(&self) -> Vec<&SearchItem> {
+        if !self.feature_enabled {
+            return Vec::new();
+        }
         self.items
             .iter()
             .filter(|x| matches_filter(&format!("{} {}", x.path, x.snippet), &self.state.filter))
@@ -159,6 +195,9 @@ pub struct ListPaneModel {
 }
 impl ListPaneModel {
     pub fn visible(&self) -> Vec<&LabelItem> {
+        if !self.feature_enabled {
+            return Vec::new();
+        }
         self.items
             .iter()
             .filter(|x| matches_filter(&x.label, &self.state.filter))
@@ -183,8 +222,18 @@ pub type BookmarksModel = ListPaneModel;
 pub type GraphListModel = ListPaneModel;
 pub type GraphLegendModel = ListPaneModel;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FeatureVisibility(pub BTreeMap<String, bool>);
+impl Default for FeatureVisibility {
+    fn default() -> Self {
+        Self(
+            tachylyte_core::CORE_FEATURES
+                .iter()
+                .map(|feature| ((*feature).to_string(), true))
+                .collect(),
+        )
+    }
+}
 impl FeatureVisibility {
     pub fn from_registry(registry: &tachylyte_core::FeatureRegistry) -> Self {
         Self(
@@ -195,7 +244,7 @@ impl FeatureVisibility {
         )
     }
     pub fn enabled(&self, feature: &str) -> bool {
-        self.0.get(feature).copied().unwrap_or(true)
+        self.0.get(feature).copied().unwrap_or(false)
     }
 }
 
@@ -207,6 +256,42 @@ impl From<tachylyte_knowledge::SearchResult> for SearchItem {
             score: result.score,
         }
     }
+}
+
+/// State bridge used by every concrete pane entity.
+pub trait PaneActivation {
+    fn pane(&mut self) -> &mut NavigationPane;
+    fn activate_id(&mut self, id: &str);
+}
+
+fn reduce_key<E: PaneActivation + 'static>(target: &Entity<E>, key: &str, app: &mut gpui::App) {
+    target.update(app, |view, cx| {
+        let pane = view.pane();
+        let action = match key {
+            "up" => Some(PaneAction::Up),
+            "down" => Some(PaneAction::Down),
+            "home" => Some(PaneAction::Home),
+            "end" => Some(PaneAction::End),
+            "enter" => Some(PaneAction::Activate),
+            "backspace" => Some(PaneAction::Filter(
+                pane.state
+                    .filter
+                    .chars()
+                    .take(pane.state.filter.chars().count().saturating_sub(1))
+                    .collect(),
+            )),
+            value if value.chars().count() == 1 => Some(PaneAction::Filter(format!(
+                "{}{}",
+                pane.state.filter, value
+            ))),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let ids: Vec<_> = pane.visible().iter().map(|item| item.id.clone()).collect();
+            pane.state.reduce(action, ids.len(), |i| ids[i].clone());
+            cx.notify();
+        }
+    });
 }
 
 /// A compact reusable GPUI view. The text label is intentionally present in the element tree,
@@ -239,49 +324,67 @@ impl NavigationPane {
             .filter(|x| matches_filter(&x.label, &self.state.filter))
             .collect()
     }
+    fn activate_id(&mut self, id: &str) {
+        if let Some(index) = self.visible().iter().position(|item| item.id == id) {
+            self.state.activate_at(index, id.to_string());
+        }
+    }
+}
+impl PaneActivation for NavigationPane {
+    fn pane(&mut self) -> &mut NavigationPane {
+        self
+    }
+    fn activate_id(&mut self, id: &str) {
+        self.activate_id(id);
+    }
 }
 impl Render for NavigationPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_content(Some(cx.entity()))
+        render_navigation_content(self, cx.entity())
     }
 }
-impl NavigationPane {
-    fn render_content(&mut self, click_target: Option<Entity<Self>>) -> impl IntoElement {
-        if !self.features.enabled(&self.feature) {
-            return div()
-                .id("navigation-pane-disabled")
-                .child(format!("{} unavailable", self.title));
-        }
-        let title = self.title.clone();
-        let rows = self.visible().into_iter().enumerate().map(|(i, item)| {
-            let id = item.id.clone();
-            let mut row =
-                div()
-                    .id(("navigation-row", i))
-                    .p_1()
-                    .child(if i == self.state.selected {
-                        format!("› {}", item.label)
-                    } else {
-                        item.label.clone()
-                    });
-            if let Some(target) = click_target.clone() {
-                row = row.on_click(move |_, _, cx| {
-                    target.update(cx, |pane, cx| {
-                        pane.state.events.push(PaneEvent::Activated(id.clone()));
-                        cx.notify();
-                    });
-                });
-            }
-            row
-        });
-        div()
-            .id("navigation-pane")
-            .key_context("navigation-pane")
-            .flex()
-            .flex_col()
-            .child(title)
-            .children(rows)
+fn render_navigation_content<E: PaneActivation + 'static>(
+    pane: &mut NavigationPane,
+    target: Entity<E>,
+) -> impl IntoElement {
+    if !pane.features.enabled(&pane.feature) {
+        return div()
+            .id("navigation-pane-disabled")
+            .child(format!("{} unavailable", pane.title));
     }
+    let title = pane.title.clone();
+    let rows = pane.visible().into_iter().enumerate().map(|(i, item)| {
+        let id = item.id.clone();
+        let mut row = div()
+            .id(("navigation-row", i))
+            .focusable()
+            .tab_index(i as isize)
+            .p_1()
+            .child(if i == pane.state.selected {
+                format!("selected: {}", item.label)
+            } else {
+                item.label.clone()
+            });
+        let target = target.clone();
+        row = row.on_click(move |_, _, cx| {
+            target.update(cx, |view, cx| {
+                view.activate_id(&id);
+                cx.notify();
+            });
+        });
+        row
+    });
+    let key_target = target.clone();
+    div()
+        .id("navigation-pane")
+        .key_context("navigation-pane")
+        .focusable()
+        .tab_index(0)
+        .on_key_down(move |event, _, app| reduce_key(&key_target, &event.keystroke.key, app))
+        .flex()
+        .flex_col()
+        .child(title)
+        .children(rows)
 }
 
 macro_rules! pane_view {
@@ -290,9 +393,17 @@ macro_rules! pane_view {
         pub struct $name {
             pub pane: NavigationPane,
         }
+        impl PaneActivation for $name {
+            fn pane(&mut self) -> &mut NavigationPane {
+                &mut self.pane
+            }
+            fn activate_id(&mut self, id: &str) {
+                self.pane.activate_id(id);
+            }
+        }
         impl Render for $name {
-            fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-                self.pane.render_content(None)
+            fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                render_navigation_content(&mut self.pane, cx.entity())
             }
         }
     };
@@ -341,5 +452,84 @@ mod tests {
             s.take_events(),
             vec![PaneEvent::Toggled("docs".into(), false)]
         );
+    }
+    #[test]
+    fn click_activation_selects_before_activating() {
+        let mut view = QuickSwitcher {
+            pane: NavigationPane::new(
+                "Quick switcher",
+                "search",
+                vec![LabelItem {
+                    id: "a".into(),
+                    label: "Alpha".into(),
+                }],
+            ),
+        };
+        view.activate_id("a");
+        assert_eq!(view.pane.state.selected, 0);
+        assert_eq!(
+            view.pane.state.take_events(),
+            vec![
+                PaneEvent::Selected("a".into()),
+                PaneEvent::Activated("a".into())
+            ]
+        );
+    }
+    #[test]
+    fn collapsed_parent_reveals_matching_descendant_without_mutating_collapse() {
+        let mut model = FileExplorerModel {
+            nodes: vec![FileNode {
+                id: "docs".into(),
+                label: "Docs".into(),
+                folder: true,
+                children: vec![FileNode {
+                    id: "résumé".into(),
+                    label: "Résumé".into(),
+                    folder: false,
+                    children: vec![],
+                }],
+            }],
+            feature_enabled: true,
+            ..Default::default()
+        };
+        model.state.collapsed.insert("docs".into());
+        assert_eq!(model.visible().len(), 1);
+        model.state.filter = "resume".into();
+        assert_eq!(
+            model
+                .visible()
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs", "résumé"]
+        );
+        assert!(model.state.collapsed.contains("docs"));
+        model.state.filter.clear();
+        assert_eq!(
+            model
+                .visible()
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["docs"]
+        );
+    }
+    #[test]
+    fn normalized_filter_matches_decomposed_and_composed_text() {
+        assert!(matches_filter("café", "CAFE"));
+        assert!(matches_filter("cafe\u{301}", "café"));
+    }
+    #[test]
+    fn model_feature_flags_hide_rows() {
+        let mut model = ListPaneModel {
+            items: vec![LabelItem {
+                id: "x".into(),
+                label: "X".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(model.visible().is_empty());
+        model.feature_enabled = true;
+        assert_eq!(model.visible().len(), 1);
     }
 }
