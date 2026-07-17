@@ -340,6 +340,14 @@ pub enum Effect {
 impl Workspace {
     pub fn dispatch(&mut self, action: Action) -> Vec<Effect> {
         let mut effects = Vec::new();
+        // Focus is observational: an invalid target must be a strict no-op.
+        // In particular, do not run the post-action normalizer, since that
+        // would make an unsuccessful focus request mutate persisted state.
+        if let Action::Focus { tab } = &action {
+            if self.find_tab(tab).is_none() {
+                return effects;
+            }
+        }
         match action {
             Action::Open { window, view } => {
                 if !self.view_kinds.is_empty() && !self.view_kinds.contains(&view.kind) {
@@ -1080,5 +1088,26 @@ mod tests {
             g.id.clear();
         }
         assert!(!w.validate());
+    }
+    #[test]
+    fn invalid_focus_is_a_byte_for_byte_noop_without_normalization() {
+        let mut w = Workspace::default();
+        let first = tab(&mut w, "a");
+        let second = tab(&mut w, "b");
+        w.dispatch(Action::Split {
+            tab: second,
+            orientation: Orientation::Horizontal,
+        });
+        if let LayoutNode::Split { ratio, .. } = &mut w.windows[0].root {
+            *ratio = 0.99;
+        }
+        let snapshot = serde_json::to_vec(&w).unwrap();
+        assert!(w
+            .dispatch(Action::Focus {
+                tab: "does-not-exist".into()
+            })
+            .is_empty());
+        assert_eq!(serde_json::to_vec(&w).unwrap(), snapshot);
+        assert!(w.find_tab(&first).is_some());
     }
 }
