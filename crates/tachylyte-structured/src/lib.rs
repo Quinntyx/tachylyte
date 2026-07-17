@@ -84,26 +84,30 @@ impl CanvasDocument {
         self.nodes.iter().rev().find(|n| n.rect().contains(p))
     }
     pub fn move_node(&mut self, id: &str, p: Point) -> Result<()> {
+        let x = finite(p.x, "x")?;
+        let y = finite(p.y, "y")?;
         let n = self
             .nodes
             .iter_mut()
             .find(|n| n.id == id)
             .ok_or_else(|| Error::Invalid("unknown node".into()))?;
-        n.x = finite(p.x, "x")?;
-        n.y = finite(p.y, "y")?;
+        n.x = x;
+        n.y = y;
         Ok(())
     }
     pub fn resize_node(&mut self, id: &str, size: Size) -> Result<()> {
+        let width = finite(size.width, "width")?;
+        let height = finite(size.height, "height")?;
+        if width < 0.0 || height < 0.0 {
+            return Err(Error::Invalid("size must be non-negative".into()));
+        }
         let n = self
             .nodes
             .iter_mut()
             .find(|n| n.id == id)
             .ok_or_else(|| Error::Invalid("unknown node".into()))?;
-        n.width = finite(size.width, "width")?;
-        n.height = finite(size.height, "height")?;
-        if n.width < 0.0 || n.height < 0.0 {
-            return Err(Error::Invalid("size must be non-negative".into()));
-        }
+        n.width = width;
+        n.height = height;
         Ok(())
     }
     pub fn connect(&mut self, edge: Edge) -> Result<()> {
@@ -573,6 +577,37 @@ mod tests {
         assert!(evaluate("missing", &r).is_err());
         assert!(evaluate("1e308 + 1e308", &r).is_err());
     }
+
+    #[test]
+    fn staged_geometry_and_escaped_literals() {
+        let mut c = CanvasDocument {
+            nodes: vec![node("a", 1.)],
+            ..Default::default()
+        };
+        assert!(c.move_node("a", Point { x: 9., y: f64::NAN }).is_err());
+        assert_eq!(c.node("a").unwrap().x, 1.);
+        assert!(c
+            .resize_node(
+                "a",
+                Size {
+                    width: 20.,
+                    height: -1.
+                }
+            )
+            .is_err());
+        assert_eq!(c.node("a").unwrap().width, 10.);
+        let mut r = Record::new();
+        r.insert("s".into(), Value::from("unused"));
+        assert_eq!(
+            evaluate(r#""a\"\\\n東京""#, &r).unwrap(),
+            Datum::Text("a\"\\\n東京".into())
+        );
+        assert_eq!(evaluate("1.25e+2", &r).unwrap(), Datum::Number(125.));
+        assert_eq!(evaluate("-2e-2", &r).unwrap(), Datum::Number(-0.02));
+        assert!(evaluate("1e309", &r).is_err());
+        assert!(evaluate("1e", &r).is_err());
+        assert!(evaluate(r#""bad\q""#, &r).is_err());
+    }
 }
 pub fn evaluate(formula: &str, record: &Record) -> Result<Datum> {
     let mut p = Parser::new(formula, record);
@@ -743,28 +778,72 @@ impl<'a> Parser<'a> {
             return Ok(x);
         }
         if self.eat(b'"') {
-            let start = self.i;
-            while self.s.get(self.i).is_some_and(|c| *c != b'"') {
-                self.i += 1;
+            let mut out = String::new();
+            loop {
+                let Some(c) = std::str::from_utf8(&self.s[self.i..])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                else {
+                    return Err(Error::Formula("unterminated string".into()));
+                };
+                self.i += c.len_utf8();
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        let Some(escaped) = std::str::from_utf8(&self.s[self.i..])
+                            .ok()
+                            .and_then(|s| s.chars().next())
+                        else {
+                            return Err(Error::Formula("unterminated escape".into()));
+                        };
+                        self.i += escaped.len_utf8();
+                        out.push(match escaped {
+                            '"' => '"',
+                            '\\' => '\\',
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            other => {
+                                return Err(Error::Formula(format!("invalid escape \\{other}")))
+                            }
+                        });
+                    }
+                    other => out.push(other),
+                }
             }
-            if !self.eat(b'"') {
-                return Err(Error::Formula("unterminated string".into()));
-            }
-            return Ok(Datum::Text(
-                std::str::from_utf8(&self.s[start..self.i - 1])
-                    .unwrap_or_default()
-                    .to_owned(),
-            ));
+            return Ok(Datum::Text(out));
         }
         let start = self.i;
-        while self
-            .s
-            .get(self.i)
-            .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
-        {
-            self.i += 1
+        if self.s.get(self.i).is_some_and(|c| *c == b'+' || *c == b'-') {
+            self.i += 1;
         }
-        if self.i > start {
+        let integer_start = self.i;
+        while self.s.get(self.i).is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        let mut digits = self.i > integer_start;
+        if self.s.get(self.i) == Some(&b'.') {
+            self.i += 1;
+            let fraction_start = self.i;
+            while self.s.get(self.i).is_some_and(|c| c.is_ascii_digit()) {
+                self.i += 1;
+            }
+            digits |= self.i > fraction_start;
+        }
+        if self.s.get(self.i).is_some_and(|c| *c == b'e' || *c == b'E') {
+            self.i += 1;
+            if self.s.get(self.i).is_some_and(|c| *c == b'+' || *c == b'-') {
+                self.i += 1;
+            }
+            let exponent_start = self.i;
+            while self.s.get(self.i).is_some_and(|c| c.is_ascii_digit()) {
+                self.i += 1;
+            }
+            if self.i == exponent_start {
+                return Err(Error::Formula("exponent requires digits".into()));
+            }
+        }
+        if self.i > start && digits {
             let n: f64 = std::str::from_utf8(&self.s[start..self.i])
                 .unwrap()
                 .parse()
