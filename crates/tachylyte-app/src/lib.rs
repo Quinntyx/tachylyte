@@ -12,6 +12,8 @@ use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
 use tachylyte_markdown::{EditorDocument, ViewMode};
 
 mod graph_view;
+mod tab_notice;
+mod tab_policy;
 mod theme_helpers;
 mod workspace_actions;
 
@@ -1344,8 +1346,7 @@ impl Render for Shell {
                     .text_color(muted)
                     .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                         close_title.update(cx, |shell, cx| {
-                            shell.controller.document = None;
-                            shell.controller.status = "Tab closed".into();
+                            shell.controller.try_close_document();
                             cx.notify();
                         });
                     })
@@ -1733,6 +1734,12 @@ mod tests {
         assert!(c.insert_text("changed"));
         assert!(!c.select(&VaultPath::new("b.md").unwrap()));
         assert!(c.status.contains("Unsaved"));
+        assert!(!c.try_close_document());
+        assert!(c.document.is_some());
+        assert!(c.status.contains("save"));
+        assert!(c.save());
+        assert!(c.try_close_document());
+        assert!(c.document.is_none());
     }
     #[test]
     fn save_reindexes_changed_content_and_rejects_unscanned_files() {

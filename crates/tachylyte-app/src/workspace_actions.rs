@@ -4,9 +4,30 @@ use std::path::PathBuf;
 
 use tachylyte_core::{FileKind, VaultPath};
 
-use crate::AppController;
+use crate::{tab_notice, tab_policy, AppController};
 
 impl AppController {
+    /// Close the selected document when it has no unsaved changes.
+    pub fn try_close_document(&mut self) -> bool {
+        let is_dirty = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.editor.is_dirty());
+
+        if tab_policy::close_decision(is_dirty) == tab_policy::CloseDecision::Blocked {
+            self.status = tab_notice::dirty_close_notice().into();
+            return false;
+        }
+
+        let had_document = self.document.take().is_some();
+        self.status = if had_document {
+            "Document closed".into()
+        } else {
+            "No document".into()
+        };
+        true
+    }
+
     /// Create a uniquely named Markdown note, then open it in the editor.
     pub fn create_note(&mut self) -> bool {
         let Some(vault) = &self.vault else {
