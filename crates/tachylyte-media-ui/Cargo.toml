@@ -1,0 +1,11 @@
+[package]
+name = "tachylyte-media-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native GPUI media leaf views for Tachylyte"
+
+[dependencies]
+gpui.workspace = true
+tachylyte-theme.workspace = true
+tachylyte-workflows.workspace = true
