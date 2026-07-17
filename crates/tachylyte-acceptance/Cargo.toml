@@ -1,0 +1,18 @@
+[package]
+name = "tachylyte-acceptance"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Cross-domain public-API parity acceptance tests"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+tempfile = "3"
+tachylyte-core = { path = "../tachylyte-core" }
+tachylyte-knowledge = { path = "../tachylyte-knowledge" }
+tachylyte-markdown = { path = "../tachylyte-markdown" }
+tachylyte-services = { path = "../tachylyte-services" }
+tachylyte-structured = { path = "../tachylyte-structured" }
+tachylyte-workflows = { path = "../tachylyte-workflows" }
+tachylyte-workspace = { path = "../tachylyte-workspace" }

@@ -1,0 +1,9 @@
+properties:
+  status: active
+views:
+  - name: Active projects
+    filter: 'status = "active"'
+    sort:
+      - property: status
+        direction: asc
+    future-view-key: retained
