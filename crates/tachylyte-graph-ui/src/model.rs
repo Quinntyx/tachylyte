@@ -12,10 +12,14 @@ pub struct Point {
 }
 
 /// Pan and zoom state shared by rendering and interaction.
+///
+/// The fields are private so an invalid zoom cannot be introduced through a
+/// struct literal. Use [`Self::new`], [`Self::set_zoom`], or [`Self::zoom_by`]
+/// to update the viewport.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewTransform {
-    pub pan: Point,
-    pub zoom: f32,
+    pan: Point,
+    zoom: f32,
 }
 
 impl Default for ViewTransform {
@@ -28,24 +32,82 @@ impl Default for ViewTransform {
 }
 
 impl ViewTransform {
+    const MIN_ZOOM: f32 = 0.1;
+    const MAX_ZOOM: f32 = 8.0;
+
+    /// Construct a transform, clamping zoom to the supported finite range.
+    pub fn new(pan: Point, zoom: f32) -> Self {
+        Self {
+            pan: finite_point(pan),
+            zoom: valid_zoom(zoom),
+        }
+    }
+
+    /// Return the current screen-space pan.
+    pub fn pan(&self) -> Point {
+        self.pan
+    }
+
+    /// Return the current positive, finite zoom factor.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Replace the pan, saturating non-finite components to safe values.
+    pub fn set_pan(&mut self, pan: Point) {
+        self.pan = finite_point(pan);
+    }
+
+    /// Replace the zoom, clamping it to the supported range.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = valid_zoom(zoom);
+    }
+
     pub fn screen(&self, point: Point) -> Point {
         Point {
-            x: point.x * self.zoom + self.pan.x,
-            y: point.y * self.zoom + self.pan.y,
+            x: finite(point.x * self.zoom + self.pan.x),
+            y: finite(point.y * self.zoom + self.pan.y),
         }
     }
 
     pub fn world(&self, point: Point) -> Point {
         Point {
-            x: (point.x - self.pan.x) / self.zoom,
-            y: (point.y - self.pan.y) / self.zoom,
+            x: finite((point.x - self.pan.x) / self.zoom),
+            y: finite((point.y - self.pan.y) / self.zoom),
         }
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
         if factor.is_finite() && factor > 0.0 {
-            self.zoom = (self.zoom * factor).clamp(0.1, 8.0);
+            self.zoom = valid_zoom(self.zoom * factor);
         }
+    }
+}
+
+fn valid_zoom(zoom: f32) -> f32 {
+    if zoom.is_nan() {
+        1.0
+    } else if zoom.is_sign_negative() || zoom == 0.0 {
+        ViewTransform::MIN_ZOOM
+    } else {
+        zoom.clamp(ViewTransform::MIN_ZOOM, ViewTransform::MAX_ZOOM)
+    }
+}
+
+fn finite(value: f32) -> f32 {
+    if value.is_nan() {
+        0.0
+    } else if value.is_infinite() {
+        value.signum() * f32::MAX
+    } else {
+        value
+    }
+}
+
+fn finite_point(point: Point) -> Point {
+    Point {
+        x: finite(point.x),
+        y: finite(point.y),
     }
 }
 
@@ -236,8 +298,10 @@ impl GraphViewModel {
 
     /// Move the viewport in screen-space pixels.
     pub fn pan_by(&mut self, delta: Point) {
-        self.transform.pan.x += delta.x;
-        self.transform.pan.y += delta.y;
+        self.transform.set_pan(Point {
+            x: self.transform.pan().x + delta.x,
+            y: self.transform.pan().y + delta.y,
+        });
     }
 }
 

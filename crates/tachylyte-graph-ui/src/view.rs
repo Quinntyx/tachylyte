@@ -12,6 +12,7 @@ pub struct GraphView {
 }
 
 impl GraphView {
+    /// Wrap a prepared model for mounting in a GPUI view tree.
     pub fn new(model: GraphViewModel) -> Self {
         Self { model }
     }
