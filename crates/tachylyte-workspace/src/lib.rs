@@ -241,6 +241,8 @@ pub struct Workspace {
     pub sidebar: Vec<SidebarTab>,
     pub status: Vec<StatusItem>,
     pub commands: Vec<Command>,
+    #[serde(default)]
+    pub view_kinds: BTreeSet<String>,
     pub features: BTreeMap<String, bool>,
     pub appearance: Appearance,
     pub settings: SettingsNavigation,
@@ -281,6 +283,7 @@ impl Default for Workspace {
             sidebar: vec![],
             status: vec![],
             commands: vec![],
+            view_kinds: BTreeSet::new(),
             features: BTreeMap::new(),
             appearance: Appearance {
                 theme: Theme {
@@ -331,6 +334,7 @@ pub enum Effect {
     UnknownView(String),
     Focus(Id),
     Notice(String),
+    Error(String),
 }
 
 impl Workspace {
@@ -338,9 +342,23 @@ impl Workspace {
         let mut effects = Vec::new();
         match action {
             Action::Open { window, view } => {
-                let index = window
-                    .and_then(|x| self.windows.iter().position(|w| w.id == x))
-                    .unwrap_or(0);
+                if !self.view_kinds.is_empty() && !self.view_kinds.contains(&view.kind) {
+                    effects.push(Effect::UnknownView(view.kind.clone()));
+                }
+                if self.features.get(&view.kind).copied() == Some(false) {
+                    effects.push(Effect::Error(format!("feature disabled: {}", view.kind)));
+                    return effects;
+                }
+                let index = match window {
+                    Some(x) => match self.windows.iter().position(|w| w.id == x) {
+                        Some(i) => i,
+                        None => {
+                            effects.push(Effect::Error(format!("unknown window: {x}")));
+                            return effects;
+                        }
+                    },
+                    None => 0,
+                };
                 if let Some(w) = self.windows.get_mut(index) {
                     if let LayoutNode::Tabs(g) = &mut w.root {
                         g.tabs.push(Tab {
@@ -364,12 +382,17 @@ impl Workspace {
                 self.move_tab(&tab, &target_group);
             }
             Action::Dock { tab, target } => match target {
-                DockTarget::Group(group) => self.move_tab(&tab, &group),
-                DockTarget::Split {
-                    group, orientation, ..
-                } => {
+                DockTarget::Group(group) => {
                     self.move_tab(&tab, &group);
-                    self.split_tab(&tab, orientation);
+                }
+                DockTarget::Split {
+                    group,
+                    orientation,
+                    before,
+                } => {
+                    if self.move_tab(&tab, &group) {
+                        self.split_group(&group, orientation, before);
+                    }
                 }
                 DockTarget::Sidebar => {
                     if let Some(t) = self.take_tab(&tab) {
@@ -445,7 +468,12 @@ impl Workspace {
             }
             Action::SetFeature { feature, enabled } => {
                 self.features.insert(feature.clone(), enabled);
-                if !enabled {
+                if enabled {
+                    self.commands
+                        .iter_mut()
+                        .filter(|c| c.core_feature.as_deref() == Some(&feature))
+                        .for_each(|c| c.enabled = true);
+                } else {
                     self.disable_feature(&feature);
                 }
             }
@@ -477,15 +505,25 @@ impl Workspace {
                     effects.push(Effect::Notice("hotkey conflict".into()));
                 }
             }
-            Action::Restore(s) => {
-                if let Ok(mut loaded) = serde_json::from_str::<Workspace>(&s) {
+            Action::Restore(s) => match serde_json::from_str::<Workspace>(&s) {
+                Ok(mut loaded) if loaded.schema_version <= 1 => {
                     migrate(&mut loaded);
-                    *self = loaded;
+                    if loaded.validate() {
+                        *self = loaded;
+                    } else {
+                        effects.push(Effect::Error("invalid workspace layout".into()));
+                    }
                 }
-            }
-            Action::Save(_) => {
+                Ok(loaded) => effects.push(Effect::Error(format!(
+                    "unsupported workspace schema {}",
+                    loaded.schema_version
+                ))),
+                Err(error) => effects.push(Effect::Error(format!("restore failed: {error}"))),
+            },
+            Action::Save(path) => {
                 if let Ok(s) = serde_json::to_string(self) {
                     effects.push(Effect::Persist(s));
+                    effects.push(Effect::Notice(format!("workspace saved: {path}")));
                 }
             }
             Action::DismissNotice(n) => self.notices.retain(|x| x.id != n),
@@ -497,7 +535,12 @@ impl Workspace {
     }
 
     pub fn validate(&self) -> bool {
-        self.windows.iter().all(|w| valid_node(&w.root))
+        let mut windows = BTreeSet::new();
+        let mut groups = BTreeSet::new();
+        let mut tabs = BTreeSet::new();
+        self.windows.iter().all(|w| {
+            windows.insert(w.id.clone()) && valid_node_ids(&w.root, &mut groups, &mut tabs)
+        })
     }
     fn feature_enabled(&self, f: Option<&str>) -> bool {
         f.map(|x| self.features.get(x).copied().unwrap_or(true))
@@ -514,10 +557,14 @@ impl Workspace {
         self.sidebar.retain(|s| s.view.kind != f);
     }
     fn normalize(&mut self) {
-        self.windows.retain(|w| valid_node(&w.root));
-        for w in &mut self.windows {
-            normalize_node(&mut w.root);
+        let mut windows = Vec::new();
+        for mut w in self.windows.drain(..) {
+            if let Some(root) = clean_node(w.root) {
+                w.root = root;
+                windows.push(w);
+            }
         }
+        self.windows = windows;
         let ids: BTreeSet<_> = self.windows.iter().flat_map(|w| tab_ids(&w.root)).collect();
         self.mru.retain(|x| ids.contains(x));
         if self.focused.as_ref().is_some_and(|(_, t)| !ids.contains(t)) {
@@ -552,13 +599,41 @@ impl Workspace {
             .find_map(|w| take_tab(&mut w.root, tab))
     }
     fn remove_tab(&mut self, tab: &str) {
-        let _ = self.take_tab(tab);
+        let was_focused = self.focused.as_ref().is_some_and(|(_, t)| t == tab);
+        let removed = self.take_tab(tab).is_some();
+        if removed && was_focused {
+            self.normalize();
+            if let Some(next) = self.mru.first().cloned().or_else(|| {
+                self.windows
+                    .iter()
+                    .find_map(|w| tab_ids(&w.root).into_iter().next())
+            }) {
+                self.focus(&next);
+            } else {
+                self.focused = None;
+            }
+        }
     }
-    fn move_tab(&mut self, tab: &str, group: &str) {
-        if let Some(t) = self.take_tab(tab) {
-            if let Some(g) = self.find_group_mut(group) {
-                g.tabs.push(t);
-                g.active = g.tabs.len() - 1;
+    fn move_tab(&mut self, tab: &str, group: &str) -> bool {
+        if self.find_group_mut(group).is_none() || self.find_tab(tab).is_none() {
+            return false;
+        }
+        let t = match self.take_tab(tab) {
+            Some(t) => t,
+            None => return false,
+        };
+        if let Some(g) = self.find_group_mut(group) {
+            g.tabs.push(t);
+            g.active = g.tabs.len() - 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn split_group(&mut self, group: &str, orientation: Orientation, before: bool) {
+        for w in &mut self.windows {
+            if split_group_node(&mut w.root, group, orientation, before) {
+                break;
             }
         }
     }
@@ -573,7 +648,10 @@ impl Workspace {
 
 fn valid_node(n: &LayoutNode) -> bool {
     match n {
-        LayoutNode::Tabs(g) => g.active <= g.tabs.len() && g.tabs.iter().all(|t| !t.id.is_empty()),
+        LayoutNode::Tabs(g) => {
+            (g.tabs.is_empty() && g.active == 0 || !g.tabs.is_empty() && g.active < g.tabs.len())
+                && g.tabs.iter().all(|t| !t.id.is_empty())
+        }
         LayoutNode::Split {
             ratio,
             first,
@@ -588,25 +666,44 @@ fn valid_node(n: &LayoutNode) -> bool {
         }
     }
 }
-fn normalize_node(n: &mut LayoutNode) {
+fn valid_node_ids(n: &LayoutNode, groups: &mut BTreeSet<Id>, tabs: &mut BTreeSet<Id>) -> bool {
     match n {
         LayoutNode::Tabs(g) => {
+            groups.insert(g.id.clone())
+                && valid_node(n)
+                && g.tabs.iter().all(|t| tabs.insert(t.id.clone()))
+        }
+        LayoutNode::Split { first, second, .. } => {
+            valid_node_ids(first, groups, tabs) && valid_node_ids(second, groups, tabs)
+        }
+    }
+}
+fn clean_node(n: LayoutNode) -> Option<LayoutNode> {
+    match n {
+        LayoutNode::Tabs(mut g) => {
             if g.tabs.is_empty() {
-                g.active = 0;
+                None
             } else {
                 g.active = g.active.min(g.tabs.len() - 1);
+                Some(LayoutNode::Tabs(g))
             }
         }
         LayoutNode::Split {
+            orientation,
             ratio,
             first,
             second,
-            ..
-        } => {
-            *ratio = ratio.clamp(0.1, 0.9);
-            normalize_node(first);
-            normalize_node(second);
-        }
+        } => match (clean_node(*first), clean_node(*second)) {
+            (Some(a), Some(b)) => Some(LayoutNode::Split {
+                orientation,
+                ratio: ratio.clamp(0.1, 0.9),
+                first: Box::new(a),
+                second: Box::new(b),
+            }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            _ => None,
+        },
     }
 }
 fn find_tab<'a>(n: &'a LayoutNode, id: &str) -> Option<&'a Tab> {
@@ -683,6 +780,49 @@ fn split_node(n: &mut LayoutNode, tab: &str, o: Orientation) -> bool {
         }
         LayoutNode::Split { first, second, .. } => {
             split_node(first, tab, o) || split_node(second, tab, o)
+        }
+        _ => false,
+    }
+}
+fn split_group_node(n: &mut LayoutNode, group: &str, o: Orientation, before: bool) -> bool {
+    match n {
+        LayoutNode::Tabs(g) if g.id == group => {
+            let old = std::mem::replace(
+                n,
+                LayoutNode::Tabs(TabGroup {
+                    id: id(),
+                    tabs: vec![],
+                    active: 0,
+                    stacked: false,
+                    extras: ExtraFields::default(),
+                }),
+            );
+            let empty = LayoutNode::Tabs(TabGroup {
+                id: id(),
+                tabs: vec![],
+                active: 0,
+                stacked: false,
+                extras: ExtraFields::default(),
+            });
+            *n = if before {
+                LayoutNode::Split {
+                    orientation: o,
+                    ratio: 0.5,
+                    first: Box::new(empty),
+                    second: Box::new(old),
+                }
+            } else {
+                LayoutNode::Split {
+                    orientation: o,
+                    ratio: 0.5,
+                    first: Box::new(old),
+                    second: Box::new(empty),
+                }
+            };
+            true
+        }
+        LayoutNode::Split { first, second, .. } => {
+            split_group_node(first, group, o, before) || split_group_node(second, group, o, before)
         }
         _ => false,
     }
@@ -775,5 +915,64 @@ mod tests {
             w.dispatch(Action::Hotkey(KeyChord::new("K"))),
             vec![Effect::Notice("hotkey conflict".into())]
         );
+    }
+    #[test]
+    fn invalid_target_move_is_transactional_and_invalid_window_errors() {
+        let mut w = Workspace::default();
+        let t = tab(&mut w, "markdown");
+        let before = serde_json::to_string(&w).unwrap();
+        assert!(w
+            .dispatch(Action::Move {
+                tab: t.clone(),
+                target_group: "missing".into()
+            })
+            .is_empty());
+        assert_eq!(serde_json::to_string(&w).unwrap(), before);
+        assert!(matches!(
+            w.dispatch(Action::Open {
+                window: Some("missing".into()),
+                view: View::new("x")
+            })
+            .as_slice(),
+            [Effect::Error(_)]
+        ));
+    }
+    #[test]
+    fn close_updates_focus_and_duplicate_ids_are_invalid() {
+        let mut w = Workspace::default();
+        let first = tab(&mut w, "a");
+        let second = tab(&mut w, "b");
+        w.dispatch(Action::Focus { tab: first.clone() });
+        w.dispatch(Action::Close { tab: first });
+        assert_eq!(w.focused.as_ref().map(|(_, id)| id), Some(&second));
+        assert!(w.validate());
+        if let LayoutNode::Tabs(g) = &mut w.windows[0].root {
+            g.tabs.push(g.tabs[0].clone());
+        }
+        assert!(!w.validate());
+    }
+    #[test]
+    fn restore_and_unknown_view_report_actionable_errors() {
+        let mut w = Workspace::default();
+        w.view_kinds.insert("known".into());
+        assert!(matches!(
+            w.dispatch(Action::Open {
+                window: None,
+                view: View::new("unknown")
+            })
+            .as_slice(),
+            [Effect::UnknownView(_)]
+        ));
+        assert!(matches!(
+            w.dispatch(Action::Restore("not-json".into())).as_slice(),
+            [Effect::Error(_)]
+        ));
+        let mut future = Workspace::default();
+        future.schema_version = 999;
+        let encoded = serde_json::to_string(&future).unwrap();
+        assert!(matches!(
+            w.dispatch(Action::Restore(encoded)).as_slice(),
+            [Effect::Error(_)]
+        ));
     }
 }
