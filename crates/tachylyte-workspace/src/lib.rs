@@ -1025,8 +1025,10 @@ mod tests {
             w.dispatch(Action::Restore("not-json".into())).as_slice(),
             [Effect::Error(_)]
         ));
-        let mut future = Workspace::default();
-        future.schema_version = 999;
+        let future = Workspace {
+            schema_version: 999,
+            ..Workspace::default()
+        };
         let encoded = serde_json::to_string(&future).unwrap();
         assert!(matches!(
             w.dispatch(Action::Restore(encoded)).as_slice(),
@@ -1081,8 +1083,10 @@ mod tests {
             .is_empty());
         w.windows[0].id.clear();
         assert!(!w.validate());
-        let mut w = Workspace::default();
-        w.focused = Some(("wrong-window".into(), "wrong-tab".into()));
+        let mut w = Workspace {
+            focused: Some(("wrong-window".into(), "wrong-tab".into())),
+            ..Workspace::default()
+        };
         assert!(!w.validate());
         if let LayoutNode::Tabs(g) = &mut w.windows[0].root {
             g.id.clear();
