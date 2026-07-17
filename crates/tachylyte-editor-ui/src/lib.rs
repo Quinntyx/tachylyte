@@ -336,19 +336,68 @@ fn next_boundary(s: &str, p: usize) -> usize {
     p
 }
 fn tokens(text: &str, offset: usize) -> Vec<Token> {
-    let kind = if text.trim_start().starts_with('#') {
-        SyntaxKind::Heading
+    let line_kind = if text.trim_start().starts_with('#') {
+        Some(SyntaxKind::Heading)
     } else if text.trim_start().starts_with("<!--") {
-        SyntaxKind::Comment
+        Some(SyntaxKind::Comment)
     } else if text.trim_start().starts_with("```") {
-        SyntaxKind::Code
+        Some(SyntaxKind::Code)
     } else {
-        SyntaxKind::Plain
+        None
     };
-    vec![Token {
-        span: Span::new(offset, offset + text.len()),
-        kind,
-    }]
+    if let Some(kind) = line_kind {
+        return vec![Token {
+            span: Span::new(offset, offset + text.len()),
+            kind,
+        }];
+    }
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        let (needle, kind) = if rest.starts_with('`') {
+            ("`", SyntaxKind::Code)
+        } else if rest.starts_with("**") {
+            ("**", SyntaxKind::Emphasis)
+        } else if rest.starts_with('*') || rest.starts_with('_') {
+            (&rest[..1], SyntaxKind::Emphasis)
+        } else if rest.starts_with('[') {
+            ("[", SyntaxKind::Link)
+        } else {
+            cursor += rest.chars().next().unwrap().len_utf8();
+            continue;
+        };
+        let end = text[cursor + needle.len()..]
+            .find(match kind {
+                SyntaxKind::Code => '`',
+                SyntaxKind::Emphasis => {
+                    if needle.len() == 2 {
+                        '*'
+                    } else {
+                        needle.chars().next().unwrap()
+                    }
+                }
+                SyntaxKind::Link => ']',
+                _ => needle.chars().next().unwrap(),
+            })
+            .map(|p| cursor + needle.len() + p + 1);
+        if let Some(end) = end {
+            out.push(Token {
+                span: Span::new(offset + cursor, offset + end),
+                kind,
+            });
+            cursor = end;
+        } else {
+            cursor += needle.len();
+        }
+    }
+    if out.is_empty() {
+        out.push(Token {
+            span: Span::new(offset, offset + text.len()),
+            kind: SyntaxKind::Plain,
+        });
+    }
+    out
 }
 
 // Keep the palette local to the editor so it remains usable in applications that do
@@ -673,15 +722,18 @@ impl Render for MarkdownEditor {
                 }
                 let end = start + grapheme.len();
                 let is_selected = start < selected.end && end > selected.start;
+                let syntax = line
+                    .tokens
+                    .iter()
+                    .find(|token| start < token.span.end && end > token.span.start)
+                    .map_or(SyntaxKind::Plain, |token| token.kind);
                 let style = if is_selected {
                     SELECTION
-                } else if mode == ViewMode::LivePreview
-                    && line.tokens.iter().any(|t| t.kind == SyntaxKind::Heading)
-                {
+                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Heading {
                     ACCENT
-                } else if mode == ViewMode::LivePreview
-                    && line.tokens.iter().any(|t| t.kind == SyntaxKind::Code)
-                {
+                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Link {
+                    ACCENT
+                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Code {
                     ACCENT
                 } else {
                     INK
@@ -694,6 +746,11 @@ impl Render for MarkdownEditor {
                     && (grapheme == "*" || grapheme == "_" || grapheme == "`")
                 {
                     part = part.text_color(rgb(MUTED));
+                }
+                if mode == ViewMode::LivePreview && syntax == SyntaxKind::Emphasis {
+                    part = part.italic();
+                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Link {
+                    part = part.underline();
                 }
                 children.push(part.into_any_element());
             }
