@@ -7,6 +7,7 @@
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, WorkflowError>;
@@ -21,6 +22,10 @@ pub enum WorkflowError {
     Disabled(String),
     #[error("invalid workflow input: {0}")]
     InvalidInput(String),
+    #[error("conversion is lossy: {0}")]
+    LossyConversion(String),
+    #[error("restore precondition failed: {0}")]
+    RestorePrecondition(String),
 }
 
 /// Validate and normalize a vault-relative path. No absolute paths or `..` are
@@ -82,6 +87,47 @@ impl FeatureRegistry {
     }
 }
 
+/// Entry-point gate used by adapters so disabled features produce no plans,
+/// commands, or background work.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowService {
+    pub registry: FeatureRegistry,
+}
+impl WorkflowService {
+    pub fn new(registry: FeatureRegistry) -> Self {
+        Self { registry }
+    }
+    pub fn compose_note(
+        &self,
+        title: &str,
+        template: Option<&str>,
+        body: &str,
+        now: DateTime<FixedOffset>,
+    ) -> Result<NotePlan> {
+        self.registry.require("note-composer")?;
+        compose_note(title, template, body, now)
+    }
+    pub fn daily_note(
+        &self,
+        config: &DailyNoteConfig,
+        now: DateTime<FixedOffset>,
+        existing: &BTreeSet<String>,
+        template: Option<&str>,
+    ) -> Result<DailyNotePlan> {
+        self.registry.require("daily-notes")?;
+        daily_note_plan(config, now, existing, template)
+    }
+    pub fn audio_start(
+        &self,
+        id: &str,
+        folder: &str,
+        now: DateTime<FixedOffset>,
+    ) -> Result<AudioSession> {
+        self.registry.require("audio-recorder")?;
+        audio_start(id, folder, now)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DailyNoteConfig {
     pub folder: String,
@@ -127,6 +173,19 @@ pub fn daily_note_plan(
         content,
         create,
     })
+}
+
+/// Variant for applications with a named timezone database. The caller resolves
+/// the instant in that timezone (including DST rules) and passes the resulting
+/// offset-aware instant here; this crate never consults process-global timezone
+/// state.
+pub fn daily_note_plan_resolved(
+    config: &DailyNoteConfig,
+    resolved_now: DateTime<FixedOffset>,
+    existing: &BTreeSet<String>,
+    template: Option<&str>,
+) -> Result<DailyNotePlan> {
+    daily_note_plan(config, resolved_now, existing, template)
 }
 
 /// Supported tokens are `{{date}}`, `{{time}}`, and `{{title}}`; format tokens
@@ -180,11 +239,31 @@ pub fn unique_note_plan(
 ) -> Result<UniqueNotePlan> {
     let folder = safe_path(folder)?;
     let clean = title.trim().replace(['/', '\\'], "-");
-    if clean.is_empty() || clean == "." || clean == ".." {
-        return Err(WorkflowError::InvalidInput("empty note title".into()));
+    if clean.is_empty() || clean == "." || clean == ".." || is_reserved_name(&clean) {
+        return Err(WorkflowError::InvalidInput(
+            "empty or reserved note title".into(),
+        ));
+    }
+    if clean
+        .chars()
+        .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+        || clean.ends_with('.')
+        || clean.ends_with(' ')
+    {
+        return Err(WorkflowError::InvalidInput(
+            "title contains platform-unsafe characters".into(),
+        ));
     }
     let ext = extension.trim_start_matches('.');
+    if ext.is_empty()
+        || ext
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+    {
+        return Err(WorkflowError::InvalidInput("invalid note extension".into()));
+    }
     let base = format!("{folder}/{clean}.{ext}");
+    safe_path(&base)?;
     let path = if !existing.contains(&base) {
         base
     } else {
@@ -209,30 +288,51 @@ pub fn unique_note_plan(
     Ok(UniqueNotePlan { path, title: clean })
 }
 
+fn is_reserved_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT1"
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LinkRewrite {
     pub from: String,
     pub to: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SourceAction {
+    Retain,
+    Delete,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanPrecondition {
+    pub path: String,
+    pub expected_content: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotePlan {
     pub content: String,
     pub rewrites: Vec<LinkRewrite>,
+    pub source_action: SourceAction,
+    pub preconditions: Vec<PlanPrecondition>,
 }
-pub fn compose_note(title: &str, template: Option<&str>, body: &str) -> Result<NotePlan> {
+pub fn compose_note(
+    title: &str,
+    template: Option<&str>,
+    body: &str,
+    now: DateTime<FixedOffset>,
+) -> Result<NotePlan> {
     let head = if let Some(t) = template {
-        render_template(
-            t,
-            DateTime::parse_from_rfc3339("2000-01-01T00:00:00+00:00").unwrap(),
-            title,
-            title,
-        )?
+        render_template(t, now, title, title)?
     } else {
         String::new()
     };
     Ok(NotePlan {
         content: format!("{head}{title}\n\n{body}"),
         rewrites: Vec::new(),
+        source_action: SourceAction::Retain,
+        preconditions: Vec::new(),
     })
 }
 pub fn split_note(
@@ -241,6 +341,11 @@ pub fn split_note(
     left_path: &str,
     right_path: &str,
 ) -> Result<(NotePlan, NotePlan)> {
+    if marker.is_empty() || left_path == right_path {
+        return Err(WorkflowError::InvalidInput(
+            "split marker and destinations must be distinct".into(),
+        ));
+    }
     safe_path(left_path)?;
     safe_path(right_path)?;
     let mut parts = content.splitn(2, marker);
@@ -251,16 +356,22 @@ pub fn split_note(
     Ok((
         NotePlan {
             content: left.into(),
-            rewrites: vec![LinkRewrite {
-                from: left_path.into(),
-                to: right_path.into(),
+            // Rewrites are metadata for links outside the two new notes. They
+            // must never be applied to either newly-created body.
+            rewrites: Vec::new(),
+            source_action: SourceAction::Retain,
+            preconditions: vec![PlanPrecondition {
+                path: left_path.into(),
+                expected_content: Some(content.to_string()),
             }],
         },
         NotePlan {
             content: right.into(),
-            rewrites: vec![LinkRewrite {
-                from: left_path.into(),
-                to: right_path.into(),
+            rewrites: Vec::new(),
+            source_action: SourceAction::Retain,
+            preconditions: vec![PlanPrecondition {
+                path: left_path.into(),
+                expected_content: Some(content.to_string()),
             }],
         },
     ))
@@ -272,6 +383,9 @@ pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Resu
             "paths and contents must match".into(),
         ));
     }
+    for path in paths {
+        safe_path(path)?;
+    }
     let content = contents.join("\n\n");
     let rewrites = paths
         .iter()
@@ -280,7 +394,19 @@ pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Resu
             to: destination.into(),
         })
         .collect();
-    Ok(NotePlan { content, rewrites })
+    let preconditions = paths
+        .iter()
+        .map(|p| PlanPrecondition {
+            path: (*p).into(),
+            expected_content: None,
+        })
+        .collect();
+    Ok(NotePlan {
+        content,
+        rewrites,
+        source_action: SourceAction::Delete,
+        preconditions,
+    })
 }
 pub fn extract_note(
     content: &str,
@@ -304,6 +430,8 @@ pub fn extract_note(
             from: "(selection)".into(),
             to: destination.into(),
         }],
+        source_action: SourceAction::Retain,
+        preconditions: Vec::new(),
     })
 }
 
@@ -313,28 +441,75 @@ pub struct ConversionPlan {
     pub warnings: Vec<String>,
 }
 pub fn convert_format(input: &str, from: &str, to: &str) -> Result<ConversionPlan> {
-    let output = match (
+    match (
         from.to_ascii_lowercase().as_str(),
         to.to_ascii_lowercase().as_str(),
     ) {
-        (a, b) if a == b => input.into(),
-        ("markdown", "plain") => input.replace("**", "").replace(['*', '`'], ""),
-        ("plain", "markdown") => input.into(),
-        ("markdown", "html") => input
-            .lines()
-            .map(|l| format!("<p>{}</p>", escape_html(l)))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => {
-            return Err(WorkflowError::InvalidInput(format!(
-                "unsupported conversion {from} -> {to}"
-            )))
-        }
-    };
-    Ok(ConversionPlan {
-        output,
-        warnings: Vec::new(),
-    })
+        (a, b) if a == b => Ok(ConversionPlan {
+            output: input.into(),
+            warnings: Vec::new(),
+        }),
+        ("markdown", "plain") => Ok(ConversionPlan {
+            output: markdown_to_plain(input),
+            warnings: vec!["markdown styling is removed outside literal code blocks".into()],
+        }),
+        ("plain", "markdown") => Ok(ConversionPlan {
+            output: input.into(),
+            warnings: Vec::new(),
+        }),
+        ("markdown", "html") => Ok(ConversionPlan {
+            output: markdown_to_html(input),
+            warnings: vec![
+                "basic HTML conversion preserves code blocks but not all Markdown extensions"
+                    .into(),
+            ],
+        }),
+        _ => Err(WorkflowError::InvalidInput(format!(
+            "unsupported conversion {from} -> {to}"
+        ))),
+    }
+}
+fn markdown_to_plain(input: &str) -> String {
+    let mut code = false;
+    input
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("```") {
+                code = !code;
+                return line.to_string();
+            }
+            if code {
+                line.to_string()
+            } else {
+                line.replace("**", "")
+                    .replace("__", "")
+                    .replace(['*', '_', '`'], "")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn markdown_to_html(input: &str) -> String {
+    let mut code = false;
+    input
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("```") {
+                code = !code;
+                return if code {
+                    "<pre><code>".into()
+                } else {
+                    "</code></pre>".into()
+                };
+            }
+            if code {
+                escape_html(line)
+            } else {
+                format!("<p>{}</p>", escape_html(line))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -420,12 +595,50 @@ pub fn restore_plan(snapshot: &Snapshot, current: &str) -> Result<ConversionPlan
         warnings: vec![format!("restore revision {}", snapshot.revision)],
     })
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub output: String,
+    pub revision: u64,
+    pub expected_current_checksum: u64,
+}
+pub fn restore_plan_checked(
+    snapshot: &Snapshot,
+    current: &str,
+    expected_revision: u64,
+    expected_checksum: u64,
+) -> Result<RestorePlan> {
+    if snapshot.revision != expected_revision {
+        return Err(WorkflowError::RestorePrecondition(
+            "revision identity mismatch".into(),
+        ));
+    }
+    let actual = checksum(current);
+    if actual != expected_checksum {
+        return Err(WorkflowError::RestorePrecondition(
+            "current content checksum mismatch".into(),
+        ));
+    }
+    Ok(RestorePlan {
+        output: snapshot.content.clone(),
+        revision: snapshot.revision,
+        expected_current_checksum: expected_checksum,
+    })
+}
+fn checksum(content: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    h.finish()
+}
 pub fn diff_snapshots(old: &str, new: &str) -> Vec<String> {
-    old.lines()
-        .zip(new.lines())
-        .enumerate()
-        .filter(|(_, (a, b))| a != b)
-        .map(|(i, (a, b))| format!("line {}: -{} +{}", i + 1, a, b))
+    let old_lines: Vec<_> = old.lines().collect();
+    let new_lines: Vec<_> = new.lines().collect();
+    (0..old_lines.len().max(new_lines.len()))
+        .filter_map(|i| match (old_lines.get(i), new_lines.get(i)) {
+            (Some(a), Some(b)) if a != b => Some(format!("line {}: -{} +{}", i + 1, a, b)),
+            (Some(a), None) => Some(format!("line {}: -{}", i + 1, a)),
+            (None, Some(b)) => Some(format!("line {}: +{}", i + 1, b)),
+            _ => None,
+        })
         .collect()
 }
 
@@ -445,22 +658,42 @@ pub struct AudioSession {
 }
 pub fn audio_start(id: &str, folder: &str, now: DateTime<FixedOffset>) -> Result<AudioSession> {
     let folder = safe_path(folder)?;
+    let session = id.trim().replace(['/', '\\'], "-");
+    if session.is_empty()
+        || session
+            .chars()
+            .any(|c| c.is_control() || "<>:\"|?*".contains(c))
+    {
+        return Err(WorkflowError::InvalidInput(
+            "invalid audio session id".into(),
+        ));
+    }
+    let attachment = format!(
+        "{folder}/audio-{}-{}.webm",
+        now.format("%Y%m%d-%H%M%S%3f"),
+        session
+    );
+    safe_path(&attachment)?;
     Ok(AudioSession {
-        id: id.into(),
+        id: session,
         state: AudioState::Recording,
-        attachment: Some(format!(
-            "{folder}/audio-{}.webm",
-            now.format("%Y%m%d-%H%M%S")
-        )),
+        attachment: Some(attachment),
     })
 }
 pub fn audio_transition(session: &AudioSession, state: AudioState) -> Result<AudioSession> {
-    if matches!(
+    let valid = matches!(
         (&session.state, &state),
-        (AudioState::Idle, AudioState::Paused)
-            | (AudioState::Stopped, _)
-            | (AudioState::Cancelled, _)
-    ) {
+        (AudioState::Idle, AudioState::Recording)
+            | (
+                AudioState::Recording,
+                AudioState::Paused | AudioState::Stopped | AudioState::Cancelled
+            )
+            | (
+                AudioState::Paused,
+                AudioState::Recording | AudioState::Stopped | AudioState::Cancelled
+            )
+    );
+    if !valid {
         return Err(WorkflowError::InvalidInput(
             "invalid audio transition".into(),
         ));
@@ -477,8 +710,26 @@ pub struct Slide {
     pub content: String,
 }
 pub fn parse_slides(markdown: &str) -> Vec<Slide> {
-    markdown
-        .split("\n---\n")
+    let mut slides = Vec::new();
+    let mut current = String::new();
+    let mut fenced = false;
+    for line in markdown.replace("\r\n", "\n").lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        if !fenced && line.trim() == "---" {
+            slides.push(current.clone());
+            current.clear();
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+    slides.push(current);
+    slides
+        .into_iter()
         .enumerate()
         .map(|(index, content)| {
             let title = content
@@ -487,7 +738,7 @@ pub fn parse_slides(markdown: &str) -> Vec<Slide> {
             Slide {
                 index,
                 title,
-                content: content.into(),
+                content,
             }
         })
         .collect()
@@ -559,5 +810,67 @@ mod tests {
         assert_eq!(retention_plan(vec![s.clone()], 1).delete.len(), 0);
         assert_eq!(parse_slides("# A\n\n---\n# B").len(), 2);
         assert_eq!(word_status("one two").words, 2);
+    }
+    #[test]
+    fn plans_are_explicit_and_split_does_not_rewrite_new_bodies() {
+        let (left, right) = split_note("a\n---\nb", "\n---\n", "source.md", "right.md").unwrap();
+        assert!(left.rewrites.is_empty() && right.rewrites.is_empty());
+        assert_eq!(left.source_action, SourceAction::Retain);
+        assert_eq!(
+            left.preconditions[0].expected_content.as_deref(),
+            Some("a\n---\nb")
+        );
+        assert!(
+            merge_notes(&["a.md"], &["a"], "merged.md")
+                .unwrap()
+                .source_action
+                == SourceAction::Delete
+        );
+        assert!(merge_notes(&["../a"], &["a"], "merged.md").is_err());
+    }
+    #[test]
+    fn fidelity_and_recovery_regressions_are_visible() {
+        let converted =
+            convert_format("before\n```\n**literal**\n```", "markdown", "plain").unwrap();
+        assert!(converted.output.contains("**literal**") && !converted.warnings.is_empty());
+        assert_eq!(
+            diff_snapshots("same", "same\nadded"),
+            vec!["line 2: +added"]
+        );
+        assert_eq!(
+            diff_snapshots("same\nremoved", "same"),
+            vec!["line 2: -removed"]
+        );
+        let s = Snapshot {
+            revision: 3,
+            timestamp: now(),
+            content: "old".into(),
+        };
+        assert!(restore_plan_checked(&s, "current", 2, checksum("current")).is_err());
+        assert!(restore_plan_checked(&s, "current", 3, checksum("wrong")).is_err());
+        assert_eq!(
+            restore_plan_checked(&s, "current", 3, checksum("current"))
+                .unwrap()
+                .revision,
+            3
+        );
+    }
+    #[test]
+    fn unsafe_names_audio_transitions_and_fenced_slides() {
+        assert!(unique_note_plan("notes", "CON", "md", &BTreeSet::new(), now()).is_err());
+        assert!(unique_note_plan("notes", "bad*name", "m:d", &BTreeSet::new(), now()).is_err());
+        let audio = audio_start("session/42", "media", now()).unwrap();
+        assert!(audio.attachment.as_ref().unwrap().contains("session-42"));
+        assert!(audio_transition(&audio, AudioState::Idle).is_err());
+        let paused = audio_transition(&audio, AudioState::Paused).unwrap();
+        assert!(audio_transition(&paused, AudioState::Stopped).is_ok());
+        assert_eq!(parse_slides("# A\n```\n---\n```\n---\r\n# B").len(), 2);
+    }
+    #[test]
+    fn disabled_service_does_not_plan_work() {
+        let mut registry = FeatureRegistry::new(["note-composer"]);
+        registry.set_enabled("note-composer", false);
+        let service = WorkflowService::new(registry);
+        assert!(service.compose_note("x", None, "body", now()).is_err());
     }
 }
