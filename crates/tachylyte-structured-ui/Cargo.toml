@@ -1,0 +1,10 @@
+[package]
+name = "tachylyte-structured-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+tachylyte-structured = { path = "../tachylyte-structured" }
+serde_json = "1"
