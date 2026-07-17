@@ -109,6 +109,30 @@ impl EditorState {
     pub fn source(&self) -> &str {
         self.document.source()
     }
+    /// Replaces the document contents with externally supplied source.
+    ///
+    /// This is intended for synchronizing the editor with application state;
+    /// unlike an edit, it starts a fresh undo history and keeps the current
+    /// clean/dirty baseline unchanged.
+    pub fn set_source(&mut self, source: impl Into<String>) {
+        let source = source.into();
+        if source == self.source() {
+            return;
+        }
+        let was_dirty = self.is_dirty();
+        self.revision = self.revision.saturating_add(1);
+        self.document = restore_document(source, self.revision);
+        self.selection = self.normalize(self.selection);
+        self.history.clear();
+        self.redo_history.clear();
+        self.marked = None;
+        self.events.push(EditorEvent::Changed {
+            revision: self.revision,
+        });
+        if was_dirty != self.is_dirty() {
+            self.events.push(EditorEvent::DirtyChanged(self.is_dirty()));
+        }
+    }
     pub fn document(&self) -> &tachylyte_markdown::Document {
         self.document.document()
     }
@@ -409,8 +433,10 @@ const INK: u32 = 0x2222_22ff;
 const MUTED: u32 = 0x5c5c_5cff;
 const BORDER: u32 = 0xe0e0_e0ff;
 const ACCENT: u32 = 0x7852_eeff;
-const CODE_BG: u32 = 0xf0eff5ff;
-const SELECTION: u32 = 0xded6_f8ff;
+// Keep secondary surfaces neutral; the accent is reserved for semantic text,
+// active controls, and the caret rather than becoming a saturated background.
+const CODE_BG: u32 = PANEL;
+const SELECTION: u32 = BORDER;
 
 fn mode_name(mode: ViewMode) -> &'static str {
     match mode {
@@ -681,13 +707,52 @@ impl Element for InputElement {
 }
 impl MarkdownEditor {
     pub fn new(source: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        Self::from_state(EditorState::new(source), cx)
+    }
+
+    /// Creates an editor view around an existing model.
+    pub fn from_state(state: EditorState, cx: &mut Context<Self>) -> Self {
         Self {
-            state: EditorState::new(source),
+            state,
             focus: cx.focus_handle(),
             scroll: Default::default(),
             accessibility_label: "Markdown editor".into(),
             last_element_bounds: Bounds::default(),
         }
+    }
+
+    pub fn state(&self) -> &EditorState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut EditorState {
+        &mut self.state
+    }
+
+    /// Replaces the model while retaining the view's focus and scroll state.
+    pub fn replace_state(&mut self, state: EditorState) {
+        self.state = state;
+    }
+
+    pub fn set_source(&mut self, source: impl Into<String>) {
+        self.state.set_source(source);
+    }
+
+    /// Changes the presentation mode and emits `EditorEvent::ModeChanged`.
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        self.state.set_mode(mode);
+    }
+
+    pub fn source(&self) -> &str {
+        self.state.source()
+    }
+
+    pub fn mode(&self) -> ViewMode {
+        self.state.mode()
+    }
+
+    pub fn take_events(&mut self) -> Vec<EditorEvent> {
+        self.state.take_events()
     }
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
@@ -729,11 +794,12 @@ impl Render for MarkdownEditor {
                     .map_or(SyntaxKind::Plain, |token| token.kind);
                 let style = if is_selected {
                     SELECTION
-                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Heading {
-                    ACCENT
-                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Link {
-                    ACCENT
-                } else if mode == ViewMode::LivePreview && syntax == SyntaxKind::Code {
+                } else if mode == ViewMode::LivePreview
+                    && matches!(
+                        syntax,
+                        SyntaxKind::Heading | SyntaxKind::Link | SyntaxKind::Code
+                    )
+                {
                     ACCENT
                 } else {
                     INK
@@ -769,7 +835,13 @@ impl Render for MarkdownEditor {
                 .children(children)
                 .into_any_element()
         });
+        // Build the reading projection from the source that is current for this
+        // render.  Keeping an owned document here also prevents a deferred GPUI
+        // child iterator from retaining a projection from an earlier frame.
+        let reading_document = (mode == ViewMode::Reading)
+            .then(|| restore_document(self.state.source().to_owned(), self.state.revision()));
         let toolbar_entity = entity.clone();
+        let toolbar_focus = focus.clone();
         let toolbar = div()
             .flex()
             .items_center()
@@ -783,6 +855,7 @@ impl Render for MarkdownEditor {
                     .into_iter()
                     .map(move |button_mode| {
                         let button_entity = toolbar_entity.clone();
+                        let button_focus = toolbar_focus.clone();
                         let active = mode == button_mode;
                         div()
                             .id(ElementId::Name(
@@ -795,7 +868,8 @@ impl Render for MarkdownEditor {
                             .bg(rgb(if active { ACCENT } else { PANEL }))
                             .text_color(rgb(if active { PAPER } else { MUTED }))
                             .child(mode_name(button_mode))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
+                                button_focus.focus(window);
                                 button_entity
                                     .update(cx, |editor, _| editor.state.set_mode(button_mode));
                             })
@@ -808,7 +882,15 @@ impl Render for MarkdownEditor {
                 .max_w(px(820.0))
                 .mx_auto()
                 .p(px(32.0))
-                .children(self.state.document().blocks.iter().map(block_element))
+                .children(
+                    reading_document
+                        .as_ref()
+                        .expect("reading document is built for reading mode")
+                        .document()
+                        .blocks
+                        .iter()
+                        .map(block_element),
+                )
                 .into_any_element()
         } else {
             div().p(px(14.0)).children(source_lines).into_any_element()
