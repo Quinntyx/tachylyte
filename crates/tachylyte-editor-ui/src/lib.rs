@@ -13,6 +13,7 @@ use gpui::{
 use std::ops::Range;
 use tachylyte_markdown::{EditorDocument, Span, ViewMode};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// A UTF-8 byte cursor. All offsets are normalized to character boundaries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -433,6 +434,10 @@ impl Element for InputElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // Registration is the authoritative per-frame geometry source. In
+        // particular, this replaces the previous frame before IME hit testing.
+        self.view
+            .update(cx, |editor, _| editor.last_element_bounds = bounds);
         window.handle_input(
             &self.focus,
             ElementInputHandler::new(bounds, self.view.clone()),
@@ -476,18 +481,18 @@ impl Render for MarkdownEditor {
             let mut children = Vec::new();
             let selected = selection.range();
             let line_end = line.span.end;
-            for (offset, ch) in line.text.char_indices() {
+            for (offset, grapheme) in line.text.grapheme_indices(true) {
                 let start = line.span.start + offset;
                 if start == cursor {
                     children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
                 }
-                let end = start + ch.len_utf8();
+                let end = start + grapheme.len();
                 let style = if start < selected.end && end > selected.start {
                     rgb(0x355070ff)
                 } else {
                     rgb(0x20242bff)
                 };
-                children.push(div().bg(style).child(ch.to_string()));
+                children.push(div().bg(style).child(grapheme.to_owned()));
             }
             if cursor == line_end {
                 children.push(div().text_color(rgb(0x5f6b7aff)).child("│"));
@@ -617,23 +622,10 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let r = utf16_to_byte_range(self.state.source(), range);
-        let line = self.state.source()[..r.start]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count();
-        let line_start = self.state.source()[..r.start]
-            .rfind('\n')
-            .map_or(0, |p| p + 1);
-        let column = display_columns(&self.state.source()[line_start..r.start]);
-        let width = display_columns(&self.state.source()[r.start..r.end]).max(1);
-        self.last_element_bounds = element_bounds;
-        Some(Bounds::new(
-            point(
-                element_bounds.origin.x + px(column as f32 * 8.0),
-                element_bounds.origin.y + px(line as f32 * 18.0),
-            ),
-            size(px(width as f32 * 8.0), px(18.0)),
+        Some(bounds_for_range_geometry(
+            self.state.source(),
+            range,
+            element_bounds,
         ))
     }
     fn character_index_for_point(
@@ -642,23 +634,11 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let origin = self.last_element_bounds.origin;
-        let line = ((f32::from(point.y) - f32::from(origin.y)) / 18.0).max(0.0) as usize;
-        let line_start = self
-            .state
-            .source()
-            .split_inclusive('\n')
-            .take(line)
-            .map(str::len)
-            .sum::<usize>();
-        let column = ((f32::from(point.x) - f32::from(origin.x)) / 8.0).max(0.0) as usize;
-        let line_text = &self.state.source()[line_start..];
-        let byte = line_text
-            .grapheme_indices(true)
-            .take(column)
-            .last()
-            .map_or(0, |(i, g)| i + g.len());
-        Some(byte_to_utf16(self.state.source(), line_start + byte))
+        Some(character_index_for_point_geometry(
+            self.state.source(),
+            point,
+            self.last_element_bounds,
+        ))
     }
 }
 fn utf16_to_byte(s: &str, n: usize) -> usize {
@@ -679,7 +659,58 @@ fn byte_to_utf16(s: &str, n: usize) -> usize {
     s[..end].encode_utf16().count()
 }
 fn display_columns(s: &str) -> usize {
-    s.graphemes(true).count()
+    s.graphemes(true).map(UnicodeWidthStr::width).sum()
+}
+/// Return the UTF-16 character index at a point in an explicitly supplied
+/// element rectangle. Horizontal overflow is clamped to that line's end.
+pub fn character_index_for_point_geometry(
+    source: &str,
+    point: Point<Pixels>,
+    bounds: Bounds<Pixels>,
+) -> usize {
+    if source.is_empty() {
+        return 0;
+    }
+    let x =
+        (f32::from(point.x) - f32::from(bounds.origin.x)).clamp(0.0, f32::from(bounds.size.width));
+    let y = (f32::from(point.y) - f32::from(bounds.origin.y))
+        .clamp(0.0, f32::from(bounds.size.height.max(px(18.0))));
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let line = ((y / 18.0) as usize).min(lines.len().saturating_sub(1));
+    let text = lines[line].trim_end_matches(['\n', '\r']);
+    let target = (x / 8.0) as usize;
+    let mut column = 0;
+    let mut byte = 0;
+    for grapheme in text.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if target < column + width.max(1) {
+            break;
+        }
+        column += width;
+        byte += grapheme.len();
+    }
+    let line_start: usize = lines.iter().take(line).map(|line| line.len()).sum();
+    byte_to_utf16(source, line_start + byte)
+}
+/// Return the caret/selection rectangle using the same grapheme display
+/// columns as [`character_index_for_point_geometry`].
+pub fn bounds_for_range_geometry(
+    source: &str,
+    range: Range<usize>,
+    bounds: Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let r = utf16_to_byte_range(source, range);
+    let line = source[..r.start].bytes().filter(|b| *b == b'\n').count();
+    let line_start = source[..r.start].rfind('\n').map_or(0, |p| p + 1);
+    let column = display_columns(&source[line_start..r.start]);
+    let width = display_columns(&source[r.start..r.end]).max(1);
+    Bounds::new(
+        point(
+            bounds.origin.x + px(column as f32 * 8.0),
+            bounds.origin.y + px(line as f32 * 18.0),
+        ),
+        size(px(width as f32 * 8.0), px(18.0)),
+    )
 }
 fn restore_document(source: String, revision: u64) -> EditorDocument {
     if revision == 0 {
@@ -787,7 +818,7 @@ mod tests {
     #[test]
     fn astral_geometry_uses_display_columns_and_utf16() {
         let source = "a🙂b";
-        assert_eq!(display_columns(&source[..5]), 2);
+        assert_eq!(display_columns(&source[..5]), 3);
         assert_eq!(byte_to_utf16(source, 5), 3);
         let origin = (40.0_f32, 24.0_f32);
         let point = (origin.0 + 2.0 * 8.0 + 1.0, origin.1 + 18.0 + 1.0);
@@ -806,5 +837,53 @@ mod tests {
         e.redo();
         assert_eq!(e.document().revision, e.revision());
         assert!(start < edited && edited < undone && undone < e.revision());
+    }
+    #[test]
+    fn geometry_roundtrips_nonzero_origin_and_replaces_stale_frame() {
+        let old = Bounds::new(point(px(10.0), px(20.0)), size(px(160.0), px(40.0)));
+        let current = Bounds::new(point(px(100.0), px(200.0)), size(px(160.0), px(40.0)));
+        let caret = bounds_for_range_geometry("a🙂b", 1..3, current);
+        assert_eq!(
+            character_index_for_point_geometry(
+                "a🙂b",
+                point(caret.origin.x + px(1.0), caret.origin.y + px(1.0)),
+                current
+            ),
+            1
+        );
+        assert_eq!(
+            character_index_for_point_geometry(
+                "a🙂b",
+                point(caret.origin.x + px(17.0), caret.origin.y + px(1.0)),
+                current
+            ),
+            3
+        );
+        assert_eq!(
+            character_index_for_point_geometry(
+                "a🙂b",
+                point(old.origin.x + px(1.0), old.origin.y + px(1.0)),
+                current
+            ),
+            0
+        );
+    }
+    #[test]
+    fn geometry_clamps_multiline_overflow_and_handles_widths() {
+        let bounds = Bounds::new(point(px(30.0), px(50.0)), size(px(80.0), px(60.0)));
+        let source = "a\n界🙂e\ne\u{301}";
+        assert_eq!(
+            character_index_for_point_geometry(source, point(px(500.0), px(51.0)), bounds),
+            1
+        );
+        assert_eq!(
+            character_index_for_point_geometry(source, point(px(30.0 + 17.0), px(69.0)), bounds),
+            3
+        );
+        assert_eq!(display_columns("界🙂e\u{301}"), 5);
+        assert_eq!(
+            bounds_for_range_geometry(source, 6..7, bounds).size.width,
+            px(8.0)
+        );
     }
 }
