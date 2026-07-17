@@ -12,6 +12,7 @@ use gpui::{
 };
 use std::ops::Range;
 use tachylyte_markdown::{EditorDocument, Span, ViewMode};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// A UTF-8 byte cursor. All offsets are normalized to character boundaries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -85,6 +86,7 @@ pub struct EditorState {
     history: Vec<(String, Selection)>,
     redo_history: Vec<(String, Selection)>,
     marked: Option<Range<usize>>,
+    revision: u64,
 }
 impl EditorState {
     pub fn new(source: impl Into<String>) -> Self {
@@ -100,6 +102,7 @@ impl EditorState {
             history: Vec::new(),
             redo_history: Vec::new(),
             marked: None,
+            revision: 0,
         }
     }
     pub fn source(&self) -> &str {
@@ -113,6 +116,9 @@ impl EditorState {
     }
     pub fn cursor(&self) -> Cursor {
         Cursor(self.selection.head.0)
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
     pub fn is_dirty(&self) -> bool {
         self.source() != self.clean_source
@@ -130,10 +136,10 @@ impl EditorState {
         self.selection = self.normalize(selection);
     }
     pub fn set_cursor(&mut self, cursor: Cursor) {
-        self.selection = Selection {
+        self.selection = self.normalize(Selection {
             anchor: cursor,
             head: cursor,
-        };
+        });
     }
     pub fn marked_range(&self) -> Option<Range<usize>> {
         self.marked.clone()
@@ -174,10 +180,11 @@ impl EditorState {
             .edit(Span::new(range.start, range.end), text)
             .is_ok()
         {
+            self.revision = self.revision.saturating_add(1);
             let pos = range.start + text.len();
             self.set_cursor(Cursor(pos));
             self.events.push(EditorEvent::Changed {
-                revision: self.document.document().revision,
+                revision: self.revision,
             });
             if was_dirty != self.is_dirty() {
                 self.events.push(EditorEvent::DirtyChanged(self.is_dirty()));
@@ -210,13 +217,10 @@ impl EditorState {
             self.redo_history
                 .push((self.source().to_owned(), self.selection));
             self.document = EditorDocument::new(source);
-            if self.document.source() == self.document.source()
-                && self.document.source() != self.source()
-            { /* keep revisioned model */
-            }
             self.selection = self.normalize(selection);
+            self.revision = self.revision.saturating_add(1);
             self.events.push(EditorEvent::Changed {
-                revision: self.document.document().revision,
+                revision: self.revision,
             });
         }
     }
@@ -226,8 +230,9 @@ impl EditorState {
                 .push((self.source().to_owned(), self.selection));
             self.document = EditorDocument::new(source);
             self.selection = self.normalize(selection);
+            self.revision = self.revision.saturating_add(1);
             self.events.push(EditorEvent::Changed {
-                revision: self.document.document().revision,
+                revision: self.revision,
             });
         }
     }
@@ -351,6 +356,7 @@ pub struct MarkdownEditor {
     focus: FocusHandle,
     scroll: gpui::ScrollHandle,
     pub accessibility_label: String,
+    last_element_bounds: Bounds<Pixels>,
 }
 
 /// Adds the GPUI 0.2.2 input protocol to an element during its paint phase.
@@ -442,6 +448,7 @@ impl MarkdownEditor {
             focus: cx.focus_handle(),
             scroll: Default::default(),
             accessibility_label: "Markdown editor".into(),
+            last_element_bounds: Bounds::default(),
         }
     }
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -618,13 +625,15 @@ impl EntityInputHandler for MarkdownEditor {
         let line_start = self.state.source()[..r.start]
             .rfind('\n')
             .map_or(0, |p| p + 1);
-        let column = self.state.source()[line_start..r.start].chars().count();
+        let column = display_columns(&self.state.source()[line_start..r.start]);
+        let width = display_columns(&self.state.source()[r.start..r.end]).max(1);
+        self.last_element_bounds = element_bounds;
         Some(Bounds::new(
             point(
                 element_bounds.origin.x + px(column as f32 * 8.0),
                 element_bounds.origin.y + px(line as f32 * 18.0),
             ),
-            size(px(((r.end - r.start).max(1)) as f32 * 8.0), px(18.0)),
+            size(px(width as f32 * 8.0), px(18.0)),
         ))
     }
     fn character_index_for_point(
@@ -633,7 +642,8 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        let line = (f32::from(point.y) / 18.0).max(0.0) as usize;
+        let origin = self.last_element_bounds.origin;
+        let line = ((f32::from(point.y) - f32::from(origin.y)) / 18.0).max(0.0) as usize;
         let line_start = self
             .state
             .source()
@@ -641,15 +651,14 @@ impl EntityInputHandler for MarkdownEditor {
             .take(line)
             .map(str::len)
             .sum::<usize>();
-        let column = (f32::from(point.x) / 8.0).max(0.0) as usize;
-        Some(
-            line_start
-                + self.state.source()[line_start..]
-                    .chars()
-                    .take(column)
-                    .map(char::len_utf8)
-                    .sum::<usize>(),
-        )
+        let column = ((f32::from(point.x) - f32::from(origin.x)) / 8.0).max(0.0) as usize;
+        let line_text = &self.state.source()[line_start..];
+        let byte = line_text
+            .grapheme_indices(true)
+            .take(column)
+            .last()
+            .map_or(0, |(i, g)| i + g.len());
+        Some(byte_to_utf16(self.state.source(), line_start + byte))
     }
 }
 fn utf16_to_byte(s: &str, n: usize) -> usize {
@@ -668,6 +677,9 @@ fn utf16_to_byte(s: &str, n: usize) -> usize {
 fn byte_to_utf16(s: &str, n: usize) -> usize {
     let end = prev_boundary(s, n);
     s[..end].encode_utf16().count()
+}
+fn display_columns(s: &str) -> usize {
+    s.graphemes(true).count()
 }
 fn utf16_to_byte_range(s: &str, r: Range<usize>) -> Range<usize> {
     utf16_to_byte(s, r.start)..utf16_to_byte(s, r.end)
@@ -751,5 +763,34 @@ mod tests {
         let lines = e.projection();
         assert_eq!(lines[0].span, Span::new(0, 3));
         assert_eq!(lines[1].span, Span::new(4, 7));
+    }
+    #[test]
+    fn cursor_is_clamped_to_utf8_boundaries() {
+        let mut e = EditorState::new("a🙂c");
+        e.set_cursor(Cursor(999));
+        assert_eq!(e.cursor(), Cursor(6));
+        e.set_cursor(Cursor(3));
+        assert_eq!(e.cursor(), Cursor(1));
+    }
+    #[test]
+    fn astral_geometry_uses_display_columns_and_utf16() {
+        let source = "a🙂b";
+        assert_eq!(display_columns(&source[..5]), 2);
+        assert_eq!(byte_to_utf16(source, 5), 3);
+        let origin = (40.0_f32, 24.0_f32);
+        let point = (origin.0 + 2.0 * 8.0 + 1.0, origin.1 + 18.0 + 1.0);
+        assert_eq!(((point.0 - origin.0) / 8.0) as usize, 2);
+        assert_eq!(((point.1 - origin.1) / 18.0) as usize, 1);
+    }
+    #[test]
+    fn edits_and_undo_have_monotonic_revisions() {
+        let mut e = EditorState::new("a");
+        let start = e.revision();
+        e.insert_text("b");
+        let edited = e.revision();
+        e.undo();
+        let undone = e.revision();
+        e.redo();
+        assert!(start < edited && edited < undone && undone < e.revision());
     }
 }

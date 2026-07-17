@@ -8,3 +8,4 @@ description = "Reusable GPUI Markdown editor and render-neutral projection"
 [dependencies]
 gpui.workspace = true
 tachylyte-markdown = { path = "../tachylyte-markdown" }
+unicode-segmentation = "1.13"
