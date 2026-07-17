@@ -389,6 +389,49 @@ impl AppController {
                 .map_or(self.cursor, |character| self.cursor + character.len_utf8());
         }
     }
+    /// Move the source cursor to the nearest column on the previous line.
+    pub fn move_up(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let source = document.editor.source();
+        let line_start = source[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        let column = self.cursor - line_start;
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = source[..previous_end]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        self.cursor = (previous_start + column).min(previous_end);
+        while self.cursor > previous_start && !source.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+    }
+    /// Move the source cursor to the nearest column on the next line.
+    pub fn move_down(&mut self) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let source = document.editor.source();
+        let line_start = source[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        let column = self.cursor - line_start;
+        let Some(next_start) = source[self.cursor..]
+            .find('\n')
+            .map(|offset| self.cursor + offset + 1)
+        else {
+            return;
+        };
+        let next_end = source[next_start..]
+            .find('\n')
+            .map_or(source.len(), |offset| next_start + offset);
+        self.cursor = (next_start + column).min(next_end);
+        while self.cursor > next_start && !source.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
+    }
     /// Execute a small, stable command-palette command.
     pub fn execute_command(&mut self, command: &str) -> bool {
         match command.trim().to_ascii_lowercase().as_str() {
@@ -696,6 +739,10 @@ impl Render for Shell {
                                                     }
                                                     "arrowright" | "right" => {
                                                         shell.controller.move_right()
+                                                    }
+                                                    "arrowup" | "up" => shell.controller.move_up(),
+                                                    "arrowdown" | "down" => {
+                                                        shell.controller.move_down()
                                                     }
                                                     "escape" => {
                                                         shell.controller.set_mode(ViewMode::Reading)
