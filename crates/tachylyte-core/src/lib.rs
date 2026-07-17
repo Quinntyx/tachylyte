@@ -28,6 +28,8 @@ pub enum CoreError {
     Duplicate(PathBuf),
     #[error("unsupported file kind: {0}")]
     Unsupported(String),
+    #[error("unknown feature: {0}")]
+    UnknownFeature(String),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("filesystem error at {path}: {source}")]
@@ -123,7 +125,7 @@ impl Vault {
                     io_at(&full, e)
                 }
             })?;
-            if !canonical.starts_with(&self.root) {
+            if canonical.strip_prefix(&self.root).is_err() {
                 return Err(CoreError::Escape(p.to_string()));
             }
         }
@@ -154,15 +156,40 @@ impl Vault {
         fs::rename(&tmp, &p).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             io_at(&p, e)
-        })
+        })?;
+        sync_parent(parent);
+        Ok(())
     }
     /// Atomically create a new file, failing if it already exists.
     pub fn create(&self, path: &VaultPath, data: &[u8]) -> Result<(), CoreError> {
         let p = self.checked(path, true)?;
-        if p.exists() {
-            return Err(CoreError::Duplicate(path.0.clone()));
+        let parent = p.parent().unwrap();
+        fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        let tmp = unique_temp(parent);
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| io_at(&tmp, e))?;
+            f.write_all(data)
+                .and_then(|_| f.sync_all())
+                .map_err(|e| io_at(&tmp, e))?;
         }
-        self.write(path, data)
+        let result = fs::hard_link(&tmp, &p).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                CoreError::Duplicate(path.0.clone())
+            } else {
+                io_at(&p, e)
+            }
+        });
+        let _ = fs::remove_file(&tmp);
+        if result.is_ok() {
+            sync_parent(parent);
+        }
+        result
     }
     /// Rename a file or directory within this vault.
     pub fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), CoreError> {
@@ -191,7 +218,17 @@ impl Vault {
     pub fn trash(&self, path: &VaultPath) -> Result<VaultPath, CoreError> {
         let from = self.checked(path, false)?;
         let dir = self.root.join(".trash");
-        fs::create_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
+        match fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => return Err(CoreError::Symlink(dir)),
+            Ok(m) if !m.is_dir() => {
+                return Err(io_at(&dir, io::Error::from(io::ErrorKind::NotADirectory)))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&dir).map_err(|x| io_at(&dir, x))?
+            }
+            Err(e) => return Err(io_at(&dir, e)),
+        }
         let name = path
             .as_path()
             .file_name()
@@ -201,6 +238,7 @@ impl Vault {
             dest.set_file_name(format!("{}-{}", name.to_string_lossy(), unique_suffix()));
         }
         fs::rename(&from, &dest).map_err(|e| io_at(&dest, e))?;
+        sync_parent(&self.root);
         Ok(VaultPath::new(dest.strip_prefix(&self.root).unwrap()).expect("internal trash path"))
     }
     /// Scan supported Obsidian files, excluding hidden directories and `.trash`.
@@ -219,7 +257,10 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<VaultEntry>) -> Result<(), Co
         if n.to_string_lossy().starts_with('.') {
             continue;
         }
-        let m = e.metadata().map_err(|x| io_at(&p, x))?;
+        let m = fs::symlink_metadata(&p).map_err(|x| io_at(&p, x))?;
+        if m.file_type().is_symlink() {
+            continue;
+        }
         if m.is_dir() {
             scan_dir(root, &p, out)?
         } else if let Some(kind) = FileKind::from_path(&p) {
@@ -240,6 +281,12 @@ fn unique_suffix() -> u128 {
 }
 fn unique_temp(p: &Path) -> PathBuf {
     p.join(format!(".tachylyte-{}.tmp", unique_suffix()))
+}
+fn sync_parent(parent: &Path) {
+    #[cfg(unix)]
+    if let Ok(file) = fs::File::open(parent) {
+        let _ = file.sync_all();
+    }
 }
 
 /// Supported Obsidian file categories.
@@ -347,12 +394,23 @@ pub const CORE_FEATURES: &[&str] = &[
     "templates",
     "properties",
     "markdown-preview",
+    "metadata-cache",
+    "attachments",
+    "import-export",
+    "themes",
+    "plugins",
+    "sync",
 ];
 /// Feature toggle registry.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FeatureRegistry {
     #[serde(default)]
     enabled: BTreeMap<String, bool>,
+}
+impl Default for FeatureRegistry {
+    fn default() -> Self {
+        Self::defaults()
+    }
 }
 impl FeatureRegistry {
     /// Defaults all known core features on.
@@ -365,8 +423,16 @@ impl FeatureRegistry {
         }
     }
     /// Set a feature state.
-    pub fn set(&mut self, id: &str, on: bool) {
+    pub fn set(&mut self, id: &str, on: bool) -> Result<(), CoreError> {
+        if !CORE_FEATURES.contains(&id) {
+            return Err(CoreError::UnknownFeature(id.to_string()));
+        }
         self.enabled.insert(id.to_string(), on);
+        Ok(())
+    }
+    /// Return whether an identifier is a built-in feature.
+    pub fn is_known(id: &str) -> bool {
+        CORE_FEATURES.contains(&id)
     }
     /// Query a feature (unknown features are disabled).
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -406,6 +472,62 @@ pub fn commands(registry: &FeatureRegistry) -> Vec<Command> {
             id: "settings.save",
             feature: "settings",
         },
+        Command {
+            id: "editor.open",
+            feature: "editor",
+        },
+        Command {
+            id: "graph.open",
+            feature: "graph",
+        },
+        Command {
+            id: "backlinks.list",
+            feature: "backlinks",
+        },
+        Command {
+            id: "daily-notes.open",
+            feature: "daily-notes",
+        },
+        Command {
+            id: "canvas.open",
+            feature: "canvas",
+        },
+        Command {
+            id: "templates.apply",
+            feature: "templates",
+        },
+        Command {
+            id: "properties.edit",
+            feature: "properties",
+        },
+        Command {
+            id: "markdown-preview.open",
+            feature: "markdown-preview",
+        },
+        Command {
+            id: "metadata-cache.refresh",
+            feature: "metadata-cache",
+        },
+        Command {
+            id: "attachments.open",
+            feature: "attachments",
+        },
+        Command {
+            id: "import-export.run",
+            feature: "import-export",
+        },
+        Command {
+            id: "themes.select",
+            feature: "themes",
+        },
+        Command {
+            id: "plugins.manage",
+            feature: "plugins",
+        },
+        Command {
+            id: "sync.run",
+            feature: "sync",
+        },
     ]
     .into_iter()
     .filter(|c| registry.is_enabled(c.feature))
@@ -439,13 +561,44 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"toggles":{"x":false},"future":{"a":1}}"#).unwrap();
         save_settings(&v, &p, &s).unwrap();
-        let got = load_settings(&v, &p).unwrap();
+        let mut got = load_settings(&v, &p).unwrap();
         assert_eq!(got.extra["future"]["a"], 1);
+        got.extra.insert("new-future".into(), Value::Bool(true));
+        save_settings(&v, &p, &got).unwrap();
+        assert_eq!(load_settings(&v, &p).unwrap().extra["future"]["a"], 1);
+        assert_eq!(load_settings(&v, &p).unwrap().extra["new-future"], true);
     }
     #[test]
     fn disabled_commands() {
         let mut r = FeatureRegistry::defaults();
-        r.set("search", false);
+        r.set("search", false).unwrap();
         assert!(!commands(&r).iter().any(|x| x.id == "search.query"));
+    }
+
+    #[test]
+    fn registry_defaults_and_unknowns() {
+        let r = FeatureRegistry::default();
+        assert_eq!(CORE_FEATURES.len(), 20);
+        assert!(CORE_FEATURES.iter().all(|id| r.is_enabled(id)));
+        assert!(!r.is_enabled("not-a-feature"));
+        let mut r = r;
+        assert!(r.set("not-a-feature", true).is_err());
+        assert_eq!(commands(&r).len(), CORE_FEATURES.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_and_trash_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("outside.md"), b"x").unwrap();
+        let v = Vault::open(d.path()).unwrap();
+        symlink(outside.path(), d.path().join("linked")).unwrap();
+        assert!(v.scan().unwrap().is_empty());
+        symlink(outside.path(), d.path().join(".trash")).unwrap();
+        let p = VaultPath::new("inside.md").unwrap();
+        v.create(&p, b"x").unwrap();
+        assert!(matches!(v.trash(&p), Err(CoreError::Symlink(_))));
     }
 }
