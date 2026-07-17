@@ -5396,6 +5396,7 @@ dependencies = [
  "tachylyte-core",
  "tachylyte-knowledge",
  "tachylyte-markdown",
+ "tachylyte-theme",
  "tempfile",
 ]
 
@@ -5418,6 +5419,15 @@ dependencies = [
  "tachylyte-markdown",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "tachylyte-graph-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "tachylyte-knowledge",
+ "tachylyte-theme",
 ]
 
 [[package]]
