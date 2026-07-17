@@ -1,0 +1,12 @@
+[package]
+name = "tachylyte-markdown"
+version = "0.1.0"
+edition = "2021"
+description = "A tolerant, render-neutral Markdown semantic model for vault editors"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "tachylyte_markdown"
+path = "src/lib.rs"
+
+[dependencies]
