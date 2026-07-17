@@ -324,8 +324,12 @@ impl EditorState {
     }
 
     pub fn replace_current_find(&mut self, replacement: &str) -> bool {
-        let Some(index) = self.find_active else { return false };
-        let Some(result) = self.find_results().get(index).copied() else { return false };
+        let Some(index) = self.find_active else {
+            return false;
+        };
+        let Some(result) = self.find_results().get(index).copied() else {
+            return false;
+        };
         self.replace(result.span.start..result.span.end, replacement);
         true
     }
@@ -608,22 +612,20 @@ fn block_element(block: &tachylyte_markdown::Block) -> AnyElement {
             .p(px(12.0))
             .mb(px(12.0))
             .text_color(rgb(INK))
-            .child(if matches!(
-                language.as_deref(),
-                Some("mermaid") | Some("diagram") | Some("plantuml")
-            ) {
-                format!(
-                    "◇ {} diagram placeholder\n{}",
-                    language.as_deref().unwrap_or("diagram"),
-                    value
-                )
-            } else {
-                format!(
-                    "{}\n{}",
-                    language.as_deref().unwrap_or("code"),
-                    value
-                )
-            })
+            .child(
+                if matches!(
+                    language.as_deref(),
+                    Some("mermaid") | Some("diagram") | Some("plantuml")
+                ) {
+                    format!(
+                        "◇ {} diagram placeholder\n{}",
+                        language.as_deref().unwrap_or("diagram"),
+                        value
+                    )
+                } else {
+                    format!("{}\n{}", language.as_deref().unwrap_or("code"), value)
+                },
+            )
             .into_any_element(),
         Block::Quote { children, .. } => div()
             .border_l_2()
@@ -933,12 +935,14 @@ impl Render for MarkdownEditor {
                 .flex()
                 .when(line_wrap, |line| line.max_w(px(760.0)))
                 .text_size(px(15.0))
-                .when(show_line_numbers, |line| line.child(
-                    div()
-                        .w(px(42.0))
-                        .text_color(rgb(MUTED))
-                        .child(format!("{:>3}", line_number)),
-                ))
+                .when(show_line_numbers, |line| {
+                    line.child(
+                        div()
+                            .w(px(42.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{:>3}", line_number)),
+                    )
+                })
                 .children(children)
                 .into_any_element()
         });
@@ -963,10 +967,11 @@ impl Render for MarkdownEditor {
                         .children(frontmatter.properties.iter().map(|property| {
                             div()
                                 .flex()
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!(
-                                    "{}: ",
-                                    property.key
-                                )))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("{}: ", property.key)),
+                                )
                                 .child(property.value.clone())
                                 .into_any_element()
                         }))
@@ -1081,22 +1086,16 @@ impl Render for MarkdownEditor {
                         }
                     }),
             )
-            .child(
-                div()
-                    .id("find-next")
-                    .cursor_pointer()
-                    .child("›")
-                    .on_click({
-                        let find_entity = find_entity.clone();
-                        let find_focus = find_focus.clone();
-                        move |_, window, cx| {
-                            find_focus.focus(window);
-                            find_entity.update(cx, |editor, _| {
-                                editor.state.move_find(false);
-                            });
-                        }
-                    }),
-            )
+            .child(div().id("find-next").cursor_pointer().child("›").on_click({
+                let find_entity = find_entity.clone();
+                let find_focus = find_focus.clone();
+                move |_, window, cx| {
+                    find_focus.focus(window);
+                    find_entity.update(cx, |editor, _| {
+                        editor.state.move_find(false);
+                    });
+                }
+            }))
             .child("Replace: use source-safe API");
         let option_controls = div()
             .flex()
@@ -1109,7 +1108,11 @@ impl Render for MarkdownEditor {
                 option_button(
                     format!(
                         "Gutter: {}",
-                        if self.options.show_line_numbers() { "on" } else { "off" }
+                        if self.options.show_line_numbers() {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     ),
                     ToolbarAction::ToggleLineNumbers,
                 ),
