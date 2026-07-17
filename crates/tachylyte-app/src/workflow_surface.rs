@@ -55,11 +55,6 @@ impl CommandPaletteSurface {
         });
     }
 
-    /// Alias for [`Self::sync_query`].
-    pub fn set_query<T>(&self, query: impl Into<String>, cx: &mut Context<T>) {
-        self.sync_query(query, cx);
-    }
-
     /// Drain typed command intents emitted since the previous call.
     pub fn drain_intents<T>(&self, cx: &mut Context<T>) -> Vec<WorkflowIntent> {
         self.entity.update(cx, |palette, _| palette.take_intents())
@@ -110,11 +105,6 @@ impl QuickSwitcherSurface {
             switcher.set_query(query);
             cx.notify();
         });
-    }
-
-    /// Alias for [`Self::sync_query`].
-    pub fn set_query<T>(&self, query: impl Into<String>, cx: &mut Context<T>) {
-        self.sync_query(query, cx);
     }
 
     /// Drain typed path-opening intents emitted since the previous call.

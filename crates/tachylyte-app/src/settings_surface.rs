@@ -26,11 +26,6 @@ impl SettingsSurface {
         }
     }
 
-    /// Return the mounted settings entity for direct GPUI updates.
-    pub fn inner(&self) -> Entity<SettingsWindow> {
-        self.inner.clone()
-    }
-
     /// Render the settings window inside a modal-style scrim.
     ///
     /// The returned element can be inserted into an application's overlay or

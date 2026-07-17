@@ -2011,9 +2011,7 @@ impl Render for Shell {
                         .text_color(accent)
                         .child("GRAPH VIEW"),
                 )
-                .child(
-                    graph_surface.expect("graph surface is mounted before render"),
-                )
+                .child(graph_surface.expect("graph surface is mounted before render"))
                 .child(div().flex_1())
                 .child(
                     div()
