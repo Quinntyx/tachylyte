@@ -1,5 +1,7 @@
 //! Small, dependency-free atomic file persistence primitive.
 
+#[cfg(unix)]
+use std::fs::File;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -7,8 +9,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-#[cfg(unix)]
-use std::fs::File;
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
