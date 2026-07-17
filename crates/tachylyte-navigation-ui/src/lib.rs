@@ -108,6 +108,24 @@ pub struct FileExplorerModel {
     pub feature_enabled: bool,
 }
 impl FileExplorerModel {
+    /// Create an enabled file explorer from a tree snapshot.
+    pub fn new(nodes: Vec<FileNode>) -> Self {
+        Self {
+            nodes,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, nodes: Vec<FileNode>) {
+        self.nodes = nodes;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&FileNode> {
         if !self.feature_enabled {
             return Vec::new();
@@ -170,6 +188,23 @@ pub struct SearchResultsModel {
     pub feature_enabled: bool,
 }
 impl SearchResultsModel {
+    pub fn new(items: Vec<SearchItem>) -> Self {
+        Self {
+            items,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, items: Vec<SearchItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&SearchItem> {
         if !self.feature_enabled {
             return Vec::new();
@@ -200,6 +235,23 @@ pub struct ListPaneModel {
     pub feature_enabled: bool,
 }
 impl ListPaneModel {
+    pub fn new(items: Vec<LabelItem>) -> Self {
+        Self {
+            items,
+            feature_enabled: true,
+            ..Default::default()
+        }
+    }
+    pub fn update(&mut self, items: Vec<LabelItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     pub fn visible(&self) -> Vec<&LabelItem> {
         if !self.feature_enabled {
             return Vec::new();
@@ -340,6 +392,17 @@ impl NavigationPane {
             .filter(|x| matches_filter(&x.label, &self.state.filter))
             .collect()
     }
+    /// Replace the pane snapshot while retaining filter and feature settings.
+    pub fn update_items(&mut self, items: Vec<LabelItem>) {
+        self.items = items;
+        self.state.selected = self
+            .state
+            .selected
+            .min(self.visible().len().saturating_sub(1));
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        self.state.take_events()
+    }
     fn activate_id(&mut self, id: &str) {
         if !self.features.enabled(&self.feature) {
             return;
@@ -396,6 +459,9 @@ fn render_navigation_content<E: PaneActivation + 'static>(
     if !pane.features.enabled(&pane.feature) {
         return div()
             .id("navigation-pane-disabled")
+            .p_2()
+            .bg(rgb(0xf1f1f1ff))
+            .text_color(rgb(0x5c5c5cff))
             .child(format!("{} unavailable", pane.title));
     }
     let title = pane.title.clone();
@@ -523,6 +589,52 @@ pane_view!(Properties);
 pane_view!(Bookmarks);
 pane_view!(GraphList);
 pane_view!(GraphLegend);
+
+/// The standard navigation surface used by workspace integrations.
+///
+/// The panes remain independent so callers can mount them in their preferred
+/// layout, while this small facade provides one place to construct, update,
+/// and drain their interaction events.
+#[derive(Clone, Debug)]
+pub struct WorkspacePanes {
+    pub file: FileExplorer,
+    pub search: SearchResults,
+    pub outline: Outline,
+}
+
+impl WorkspacePanes {
+    pub fn new(files: Vec<LabelItem>, results: Vec<LabelItem>, outline: Vec<LabelItem>) -> Self {
+        Self {
+            file: FileExplorer {
+                pane: NavigationPane::new("Files", "file-explorer", files),
+            },
+            search: SearchResults {
+                pane: NavigationPane::new("Search", "search", results),
+            },
+            // Outline has no separate core feature flag; it is part of the
+            // workspace navigation surface.
+            outline: Outline {
+                pane: NavigationPane::new("Outline", "workspace", outline),
+            },
+        }
+    }
+
+    pub fn update_file(&mut self, items: Vec<LabelItem>) {
+        self.file.pane.update_items(items);
+    }
+    pub fn update_search(&mut self, items: Vec<LabelItem>) {
+        self.search.pane.update_items(items);
+    }
+    pub fn update_outline(&mut self, items: Vec<LabelItem>) {
+        self.outline.pane.update_items(items);
+    }
+    pub fn take_events(&mut self) -> Vec<PaneEvent> {
+        let mut events = self.file.pane.take_events();
+        events.extend(self.search.pane.take_events());
+        events.extend(self.outline.pane.take_events());
+        events
+    }
+}
 
 #[cfg(test)]
 mod tests {

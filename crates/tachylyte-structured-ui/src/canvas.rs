@@ -247,12 +247,45 @@ impl CanvasView {
     pub fn new(model: CanvasModel) -> Self {
         Self { model }
     }
+
+    /// Construct a Canvas view directly from a document for composite mounting.
+    pub fn from_document(document: CanvasDocument) -> Self {
+        Self::new(CanvasModel::new(document))
+    }
+
+    /// Replace the displayed document while retaining viewport and selection state.
+    pub fn update_document(&mut self, document: CanvasDocument) {
+        self.model.document = document;
+        self.model
+            .selected
+            .retain(|id| self.model.document.node(id).is_some());
+    }
+
+    /// Enable or disable interaction without rebuilding the mounted view.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.model.disabled = disabled;
+    }
+
+    /// Forward a pointer press from a composite host to the canvas model.
+    pub fn pointer_down(&mut self, screen: ScreenPoint) -> Option<String> {
+        self.model.pointer_down(screen)
+    }
+
+    /// Forward a pointer delta from a composite host to the canvas model.
+    pub fn pointer_move(&mut self, delta: ScreenPoint) {
+        self.model.pointer_move(delta);
+    }
+
+    /// Drain commands emitted by this view since the previous call.
+    pub fn take_commands(&mut self) -> Vec<CanvasCommand> {
+        self.model.take_commands()
+    }
 }
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas_bg = 0xfafaf9ff;
-        let node_bg = 0xffffffff;
-        let selected = 0xeee7f7ff;
+        let node_bg = 0xfffdf9ff;
+        let selected = 0xf1eee8ff;
         let entity = cx.entity();
         let mut viewport = div()
             .id("canvas-viewport")
@@ -270,7 +303,7 @@ impl Render for CanvasView {
                     .top(px(0.))
                     .w(px(1.))
                     .h(px(4096.))
-                    .bg(rgb(0xe7e7e7ff)),
+                    .bg(rgb(0xe4e2ddff)),
             );
             viewport = viewport.child(
                 div()
@@ -279,7 +312,7 @@ impl Render for CanvasView {
                     .top(px(offset))
                     .w(px(4096.))
                     .h(px(1.))
-                    .bg(rgb(0xe7e7e7ff)),
+                    .bg(rgb(0xe4e2ddff)),
             );
         }
         // Edges are represented by deterministic midpoint connectors. A host can
@@ -295,7 +328,7 @@ impl Render for CanvasView {
                         .top(px(start.y as f32))
                         .w(px((end.x - start.x).abs().max(1.) as f32))
                         .h(px(1.))
-                        .bg(rgb(0xc4b5d8ff))
+                        .bg(rgb(0xb8b5adff))
                 } else {
                     div()
                         .absolute()
@@ -303,7 +336,7 @@ impl Render for CanvasView {
                         .top(px(start.y.min(end.y) as f32))
                         .w(px(1.))
                         .h(px((end.y - start.y).abs().max(1.) as f32))
-                        .bg(rgb(0xc4b5d8ff))
+                        .bg(rgb(0xb8b5adff))
                 });
             }
         }
@@ -327,7 +360,7 @@ impl Render for CanvasView {
                 .h(px(h as f32))
                 .bg(rgb(if active { selected } else { node_bg }))
                 .border_1()
-                .border_color(rgb(if active { 0x7c4d9eff } else { 0xd6d6d6ff }))
+                .border_color(rgb(if active { 0x8f887bff } else { 0xd6d3ccff }))
                 .p_2()
                 .text_color(rgb(0x222222ff))
                 .child(label)
@@ -346,6 +379,14 @@ impl Render for CanvasView {
         let select = entity.clone();
         let pan = entity.clone();
         let connect = entity.clone();
+        let canvas_empty = self.model.document.nodes.is_empty();
+        let status = if self.model.disabled {
+            "Canvas unavailable"
+        } else if canvas_empty {
+            "No nodes to display"
+        } else {
+            ""
+        };
         div()
             .flex()
             .flex_col()
@@ -425,7 +466,22 @@ impl Render for CanvasView {
                     )
                     .child("  ·  ⌕ Zoom"),
             )
-            .child(viewport)
+            .child(if status.is_empty() {
+                viewport
+            } else {
+                viewport.child(
+                    div()
+                        .absolute()
+                        .top(px(24.))
+                        .left(px(24.))
+                        .p_3()
+                        .bg(rgb(0xfffdf9ff))
+                        .border_1()
+                        .border_color(rgb(0xd6d3ccff))
+                        .text_color(rgb(0x68645dff))
+                        .child(status),
+                )
+            })
     }
 }
 
