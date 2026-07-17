@@ -9,6 +9,8 @@
 /target/
 **/target/
 **/*.rs.bk
+# The workspace lockfile is authoritative; member-crate lockfiles are local noise.
+/crates/*/Cargo.lock
 
 # Editor and OS noise
 .DS_Store
