@@ -652,14 +652,10 @@ fn parse_frontmatter(s: &str) -> (Option<Frontmatter>, usize) {
     let Some((close_start, end)) = close else {
         return (None, 0);
     };
-    let raw_end = close_start.saturating_sub(
-        if s.as_bytes().get(close_start.wrapping_sub(1)) == Some(&b'\n') {
-            1
-        } else {
-            0
-        },
-    );
-    let raw = s[4..raw_end].trim_end_matches(['\r', '\n']).to_owned();
+    // Exclude only the line break separating the final body line from the
+    // closing delimiter; preserve every byte inside the YAML body.
+    let raw_end = close_start.saturating_sub(newline_width_before(s, close_start));
+    let raw = s[first_len..raw_end].to_owned();
     let mut properties = Vec::new();
     let mut at = first_len;
     for line in s[first_len..raw_end].split_inclusive('\n') {
@@ -802,9 +798,13 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
     let mut text_start = 0;
     while i < s.len() {
         let rest = &s[i..];
-        let found = rest.find(|c| matches!(c, '[' | '!' | '`' | '#' | '~' | '$' | '<'));
+        let found = rest.find(|c| matches!(c, '[' | '!' | '`' | '#' | '~' | '$' | '<' | '*' | '_'));
         let Some(rel) = found else { break };
         let p = i + rel;
+        if is_escaped(s, p) && matches!(s.as_bytes().get(p), Some(b'*' | b'_')) {
+            i = p + 1;
+            continue;
+        }
         if p > text_start {
             out.push(Inline::Text {
                 value: s[text_start..p].to_owned(),
@@ -812,6 +812,37 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
             });
         }
         let r = &s[p..];
+        // Delimiter runs are parsed before links and other constructs. A
+        // marker preceded by a backslash is literal, and an unclosed pair is
+        // deliberately left in the text stream for editor-friendly recovery.
+        let mut delimiter_parsed = false;
+        for (marker, strong) in [("**", true), ("__", true), ("*", false), ("_", false)] {
+            if r.starts_with(marker)
+                && !is_escaped(s, p)
+                && !(marker.len() == 1 && r.as_bytes().get(1) == Some(&marker.as_bytes()[0]))
+                && (marker.len() == 2 || marker == "*" || !adjacent_word_marker(s, p, marker.len()))
+            {
+                if let Some(close) = find_closing_marker(s, p + marker.len(), marker) {
+                    let inside = &s[p + marker.len()..close];
+                    if !inside.is_empty() {
+                        let span = Span::new(base + p, base + close + marker.len());
+                        let children = parse_inlines(inside, base + p + marker.len());
+                        if strong {
+                            out.push(Inline::Strong { children, span });
+                        } else {
+                            out.push(Inline::Emphasis { children, span });
+                        }
+                        i = close + marker.len();
+                        text_start = i;
+                        delimiter_parsed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if delimiter_parsed {
+            continue;
+        }
         if r.starts_with("![[") {
             if let Some(e) = r[3..].find("]]") {
                 let e = p + 3 + e;
@@ -933,7 +964,12 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
                 continue;
             }
         }
-        i = p + 1;
+        let marker_width = if s[p..].starts_with("**") || s[p..].starts_with("__") {
+            2
+        } else {
+            1
+        };
+        i = p + marker_width;
         text_start = p;
     }
     if text_start < s.len() {
@@ -943,6 +979,42 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
         });
     }
     out
+}
+fn is_escaped(source: &str, at: usize) -> bool {
+    let mut slashes = 0;
+    let bytes = source.as_bytes();
+    let mut i = at;
+    while i > 0 && bytes[i - 1] == b'\\' {
+        slashes += 1;
+        i -= 1;
+    }
+    slashes % 2 == 1
+}
+fn adjacent_word_marker(source: &str, at: usize, width: usize) -> bool {
+    let before = at.checked_sub(1).and_then(|i| source[i..].chars().next());
+    let after = source[at + width..].chars().next();
+    before.is_some_and(|c| c.is_alphanumeric()) || after.is_some_and(|c| c.is_alphanumeric())
+}
+fn find_closing_marker(source: &str, from: usize, marker: &str) -> Option<usize> {
+    let mut at = from;
+    while let Some(relative) = source[at..].find(marker) {
+        let mut candidate = at + relative;
+        if !is_escaped(source, candidate) {
+            // A three-star closing run belongs to the outer `**` and the
+            // inner `*`; use the final two bytes for the strong delimiter.
+            if marker.len() == 2 {
+                let byte = marker.as_bytes()[0];
+                let mut end = candidate + marker.len();
+                while source.as_bytes().get(end) == Some(&byte) {
+                    end += 1;
+                }
+                candidate = end - marker.len();
+            }
+            return Some(candidate);
+        }
+        at = candidate + marker.len();
+    }
+    None
 }
 fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()

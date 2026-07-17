@@ -142,3 +142,66 @@ fn history_is_bounded_and_new_edits_branch() {
     assert!(!editor.redo());
     assert_eq!(editor.source(), "y");
 }
+
+#[test]
+fn crlf_frontmatter_raw_and_nested_emphasis_spans_are_exact() {
+    let source = "---\r\ntitle: café\r\ncustom: one\r\n---\r\n**bold *nested*** and \\*literal\\* and **unclosed\r\n";
+    let document = Document::parse(source);
+    assert_eq!(
+        document.frontmatter.as_ref().unwrap().raw,
+        "title: café\r\ncustom: one"
+    );
+    let block = match &document.blocks[0] {
+        Block::Paragraph { children, .. } => children,
+        other => panic!("unexpected block: {other:?}"),
+    };
+    let strong = match &block[0] {
+        Inline::Strong { children, span } => {
+            assert_eq!(span.text(source), Some("**bold *nested***"));
+            children
+        }
+        other => panic!("unexpected inline: {other:?}"),
+    };
+    match &strong[1] {
+        Inline::Emphasis { span, children } => {
+            assert_eq!(span.text(source), Some("*nested*"));
+            assert_eq!(children[0].span_text(source), Some("nested"));
+        }
+        other => panic!("unexpected nested inline: {other:?}"),
+    }
+    let escaped = block
+        .iter()
+        .find(|node| matches!(node, Inline::Text { value, .. } if value.contains("literal")))
+        .unwrap();
+    match escaped {
+        Inline::Text { value, span } => {
+            assert_eq!(value, " and \\*literal\\* and ");
+            assert_eq!(span.text(source), Some(" and \\*literal\\* and "));
+        }
+        other => panic!("unexpected escaped inline: {other:?}"),
+    }
+    assert!(block
+        .iter()
+        .any(|node| matches!(node, Inline::Text { value, .. } if value.contains("**unclosed"))));
+}
+
+trait InlineSpanText {
+    fn span_text<'a>(&self, source: &'a str) -> Option<&'a str>;
+}
+impl InlineSpanText for Inline {
+    fn span_text<'a>(&self, source: &'a str) -> Option<&'a str> {
+        match self {
+            Inline::Text { span, .. }
+            | Inline::Emphasis { span, .. }
+            | Inline::Strong { span, .. }
+            | Inline::Code { span, .. }
+            | Inline::Link { span, .. }
+            | Inline::WikiLink { span, .. }
+            | Inline::Embed { span, .. }
+            | Inline::Tag { span, .. }
+            | Inline::Highlight { span, .. }
+            | Inline::Math { span, .. }
+            | Inline::FootnoteRef { span, .. } => span.text(source),
+        }
+    }
+}
