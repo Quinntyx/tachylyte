@@ -226,39 +226,94 @@ pub fn search(index: &VaultIndex, query: &str) -> Result<Vec<SearchResult>, Quer
             SearchResult {
                 path: d.path.clone(),
                 score,
-                snippet: snippet(&d.content, terms.first().map_or("", |(_, value)| value)),
+                snippet: terms
+                    .iter()
+                    .find(|term| matches!(term.kind, TermKind::Plain | TermKind::Content))
+                    .map_or_else(String::new, |term| snippet(&d.content, &term.value)),
             }
         })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
     Ok(out)
 }
-fn positive_terms(query: &Query) -> Vec<(u8, String)> {
+#[derive(Clone, Copy)]
+enum TermKind {
+    Plain,
+    Path,
+    File,
+    Content,
+    Tag,
+    Property,
+}
+struct SearchTerm {
+    kind: TermKind,
+    key: Option<String>,
+    value: String,
+}
+fn positive_terms(query: &Query) -> Vec<SearchTerm> {
     match query {
         Query::Not(_) => Vec::new(),
         Query::And(xs) | Query::Or(xs) => xs.iter().flat_map(positive_terms).collect(),
-        Query::Term(x) => vec![(0, x.clone())],
-        Query::Path(x) => vec![(1, x.clone())],
-        Query::File(x) => vec![(2, x.clone())],
-        Query::Content(x) | Query::Tag(x) | Query::Property(_, x) => vec![(0, x.clone())],
+        Query::Term(x) => vec![SearchTerm {
+            kind: TermKind::Plain,
+            key: None,
+            value: x.clone(),
+        }],
+        Query::Path(x) => vec![SearchTerm {
+            kind: TermKind::Path,
+            key: None,
+            value: x.clone(),
+        }],
+        Query::File(x) => vec![SearchTerm {
+            kind: TermKind::File,
+            key: None,
+            value: x.clone(),
+        }],
+        Query::Content(x) => vec![SearchTerm {
+            kind: TermKind::Content,
+            key: None,
+            value: x.clone(),
+        }],
+        Query::Tag(x) => vec![SearchTerm {
+            kind: TermKind::Tag,
+            key: None,
+            value: x.clone(),
+        }],
+        Query::Property(k, x) => vec![SearchTerm {
+            kind: TermKind::Property,
+            key: Some(k.clone()),
+            value: x.clone(),
+        }],
         Query::Task(_) => Vec::new(),
     }
 }
-fn relevance(d: &Document, terms: &[(u8, String)]) -> u32 {
+fn relevance(d: &Document, terms: &[SearchTerm]) -> u32 {
     terms
         .iter()
-        .map(|(kind, term)| {
-            let value = match kind {
-                1 => &d.path,
-                2 => d.path.rsplit('/').next().unwrap_or(&d.path),
-                _ => &d.content,
-            };
-            let needle = term.to_lowercase();
-            let mut score = value.to_lowercase().matches(&needle).count() as u32 * 10;
-            if *kind == 1 && d.path.to_lowercase().contains(&needle) {
-                score += 30;
+        .map(|term| {
+            let needle = term.value.to_lowercase();
+            let occurrences =
+                |value: &str| value.to_lowercase().matches(&needle).count() as u32 * 10;
+            match term.kind {
+                TermKind::Path => occurrences(&d.path) + 30,
+                TermKind::File => occurrences(d.path.rsplit('/').next().unwrap_or(&d.path)) + 25,
+                TermKind::Content | TermKind::Plain => occurrences(&d.content),
+                TermKind::Tag => d.tags.iter().map(|tag| occurrences(tag)).sum(),
+                TermKind::Property => d
+                    .properties
+                    .iter()
+                    .map(|(key, value)| {
+                        let key_score = term.key.as_ref().map_or(0, |k| {
+                            if key.to_lowercase().contains(&k.to_lowercase()) {
+                                30
+                            } else {
+                                0
+                            }
+                        });
+                        key_score + occurrences(value)
+                    })
+                    .sum(),
             }
-            score
         })
         .sum()
 }
@@ -318,6 +373,14 @@ pub struct Link {
     pub alias: Option<String>,
     pub resolved: bool,
 }
+fn resolve_target(index: &VaultIndex, target: &str) -> Option<String> {
+    index.get(target).map(|d| d.path.clone()).or_else(|| {
+        index
+            .documents()
+            .find(|d| d.path.file_stem() == Some(target))
+            .map(|d| d.path.clone())
+    })
+}
 pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
     let mut out = Vec::new();
     if let Some(d) = index.get(source) {
@@ -331,10 +394,7 @@ pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
             let mut fields = raw.splitn(2, '|');
             let target = fields.next().unwrap_or("").trim().to_string();
             let alias = fields.next().map(|x| x.trim().to_string());
-            let resolved = index.get(&target).is_some()
-                || index
-                    .documents()
-                    .any(|x| x.path.file_stem().is_some_and(|s| s == target));
+            let resolved = resolve_target(index, &target).is_some();
             out.push(Link {
                 source: source.into(),
                 target,
@@ -348,10 +408,11 @@ pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
     out
 }
 pub fn backlinks(index: &VaultIndex, target: &str) -> Vec<Link> {
+    let canonical = resolve_target(index, target).unwrap_or_else(|| target.to_string());
     index
         .documents()
         .flat_map(|d| links(index, &d.path))
-        .filter(|l| l.target == target || l.target == target.trim_end_matches(".md"))
+        .filter(|l| resolve_target(index, &l.target).as_deref() == Some(canonical.as_str()))
         .collect()
 }
 
@@ -445,6 +506,7 @@ pub fn bookmark_roundtrip(b: &Bookmark) -> Result<Bookmark, serde_json::Error> {
 pub struct GraphNode {
     pub id: String,
     pub group: Option<String>,
+    pub unresolved: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphEdge {
@@ -464,6 +526,7 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
         .map(|d| GraphNode {
             id: d.path.clone(),
             group: d.path.split('/').next().map(str::to_string),
+            unresolved: false,
         })
         .collect::<Vec<_>>();
     ns.retain(|n| {
@@ -471,6 +534,24 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
     });
     if let Some(q) = &filter.query {
         ns.retain(|n| n.id.to_lowercase().contains(&q.to_lowercase()));
+    }
+    let sources = ns.iter().map(|n| n.id.clone()).collect::<BTreeSet<_>>();
+    if filter.include_unresolved {
+        for document in index.documents().filter(|d| sources.contains(&d.path)) {
+            for link in links(index, &document.path)
+                .into_iter()
+                .filter(|l| !l.resolved)
+            {
+                let id = unresolved_id(&link.target);
+                if !ns.iter().any(|n| n.id == id) {
+                    ns.push(GraphNode {
+                        id,
+                        group: None,
+                        unresolved: true,
+                    });
+                }
+            }
+        }
     }
     let node_ids = ns.iter().map(|n| n.id.as_str()).collect::<BTreeSet<_>>();
     let mut es = Vec::new();
@@ -487,7 +568,7 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
                     .find(|n| n.id == l.target || n.id.file_stem() == Some(l.target.as_str()))
                     .map(|n| n.id.clone())
             } else {
-                Some(l.target.clone())
+                Some(unresolved_id(&l.target))
             };
             if target.is_none() {
                 continue;
@@ -502,6 +583,9 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
     ns.sort_by(|a, b| a.id.cmp(&b.id));
     es.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
     (ns, es)
+}
+fn unresolved_id(target: &str) -> String {
+    format!("unresolved:{target}")
 }
 pub fn random_note(index: &VaultIndex, seed: u64) -> Option<&Document> {
     let mut xs = index.documents().collect::<Vec<_>>();
@@ -623,6 +707,23 @@ mod tests {
         assert_eq!(results[0].path, "folder/needle.md");
     }
     #[test]
+    fn tags_and_properties_are_scored_in_their_own_fields() {
+        let mut tagged = d("tagged.md", "no match");
+        tagged.tags = vec!["important".into()];
+        let mut property = d("property.md", "no match");
+        property
+            .properties
+            .insert("status".into(), "important".into());
+        let mut i = VaultIndex::new();
+        i.upsert(tagged);
+        i.upsert(property);
+        assert_eq!(search(&i, "tag:important").unwrap()[0].path, "tagged.md");
+        assert_eq!(
+            search(&i, "property:status=important").unwrap()[0].path,
+            "property.md"
+        );
+    }
+    #[test]
     fn malformed_or_and_quoted_values() {
         assert!(parse_query("one OR").is_err());
         assert!(parse_query("OR one").is_err());
@@ -680,6 +781,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(graph(&i, &f).1.len(), 1);
+        let (nodes, edges) = graph(&i, &f);
+        assert!(nodes
+            .iter()
+            .any(|n| n.unresolved && n.id == "unresolved:missing"));
+        assert!(edges.iter().all(|e| nodes.iter().any(|n| n.id == e.to)));
+    }
+    #[test]
+    fn backlinks_resolve_nested_basename_targets() {
+        let mut i = VaultIndex::new();
+        i.upsert(d("notes/Target.md", ""));
+        i.upsert(d("source.md", "[[Target]]"));
+        assert_eq!(backlinks(&i, "notes/Target.md")[0].source, "source.md");
+        assert_eq!(backlinks(&i, "Target")[0].source, "source.md");
     }
     #[test]
     fn graph_groups_and_edges_are_consistent() {
