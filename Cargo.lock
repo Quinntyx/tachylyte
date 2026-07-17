@@ -5471,6 +5471,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-vaults"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "tachylyte-workflows"
 version = "0.1.0"
 dependencies = [
