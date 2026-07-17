@@ -14,7 +14,10 @@ dirs = "5"
 rfd = { version = "0.17.2", default-features = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+url = "2"
 tachylyte-core = { path = "crates/tachylyte-core" }
 tachylyte-knowledge = { path = "crates/tachylyte-knowledge" }
 tachylyte-markdown = { path = "crates/tachylyte-markdown" }
+tachylyte-workflows = { path = "crates/tachylyte-workflows" }
+tachylyte-media-ui = { path = "crates/tachylyte-media-ui" }
 tachylyte-settings-ui = { path = "crates/tachylyte-settings-ui" }
