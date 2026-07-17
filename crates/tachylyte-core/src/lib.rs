@@ -97,30 +97,41 @@ pub struct Vault {
 impl Vault {
     /// Open an existing vault directory.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, CoreError> {
-        let root = root.as_ref().to_path_buf();
+        let requested = root.as_ref().to_path_buf();
+        let display_root = if requested.is_absolute() {
+            requested.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| io_at(Path::new("."), e))?
+                .join(&requested)
+        };
         #[cfg(target_os = "linux")]
         let root_cap = Arc::new(fs::File::from(
-            openat(
+            openat2(
                 CWD,
-                &root,
+                &requested,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
+                if requested.is_absolute() {
+                    ResolveFlags::NO_SYMLINKS
+                } else {
+                    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS
+                },
             )
-            .map_err(|e| io_at(&root, io::Error::from_raw_os_error(e.raw_os_error())))?,
+            .map_err(|e| io_at(&requested, io::Error::from_raw_os_error(e.raw_os_error())))?,
         ));
         #[cfg(not(target_os = "linux"))]
         {
-            let metadata = fs::symlink_metadata(&root).map_err(|e| io_at(&root, e))?;
+            let metadata = fs::symlink_metadata(&requested).map_err(|e| io_at(&requested, e))?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(CoreError::InvalidPath(format!(
                     "vault root is not a directory: {}",
-                    root.display()
+                    requested.display()
                 )));
             }
         }
-        let root = fs::canonicalize(&root).map_err(|e| io_at(&root, e))?;
         Ok(Self {
-            root,
+            root: display_root,
             #[cfg(target_os = "linux")]
             root_cap,
         })
@@ -994,5 +1005,30 @@ mod tests {
         let link = d.path().join("link");
         symlink(&actual, &link).unwrap();
         assert!(Vault::open(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_in_parent_and_fd_survives_root_swap() {
+        use std::os::unix::fs::symlink;
+        let d = tempdir().unwrap();
+        let real = d.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let outside = tempdir().unwrap();
+        let parent_link = d.path().join("parent-link");
+        symlink(&real, &parent_link).unwrap();
+        assert!(Vault::open(parent_link.join("vault")).is_err());
+
+        let vault_path = real.join("vault");
+        fs::create_dir(&vault_path).unwrap();
+        let vault = Vault::open(&vault_path).unwrap();
+        let moved = d.path().join("moved");
+        fs::rename(&vault_path, &moved).unwrap();
+        symlink(outside.path(), &vault_path).unwrap();
+        vault
+            .create(&VaultPath::new("safe.md").unwrap(), b"inside")
+            .unwrap();
+        assert!(!outside.path().join("safe.md").exists());
+        assert!(moved.join("safe.md").exists());
     }
 }
