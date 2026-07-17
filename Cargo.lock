@@ -5452,6 +5452,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-settings-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
 name = "tachylyte-structured"
 version = "0.1.0"
 dependencies = [
@@ -5468,6 +5475,15 @@ dependencies = [
  "gpui",
  "serde_json",
  "tachylyte-structured",
+]
+
+[[package]]
+name = "tachylyte-theme"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
