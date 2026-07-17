@@ -19,8 +19,13 @@ impl Span {
     pub const fn new(start: usize, end: usize) -> Self {
         Self { start, end }
     }
-    pub fn text<'a>(&self, source: &'a str) -> &'a str {
-        &source[self.start..self.end]
+    /// Returns the covered source text when this span is valid for `source`.
+    pub fn text<'a>(&self, source: &'a str) -> Option<&'a str> {
+        (self.start <= self.end
+            && self.end <= source.len()
+            && source.is_char_boundary(self.start)
+            && source.is_char_boundary(self.end))
+        .then(|| &source[self.start..self.end])
     }
 }
 
@@ -313,6 +318,8 @@ pub struct EditorDocument {
     redo: Vec<String>,
     clean_source: String,
 }
+/// Maximum number of snapshots retained in each undo/redo stack.
+pub const MAX_HISTORY: usize = 100;
 impl EditorDocument {
     pub fn new(source: impl Into<String>) -> Self {
         let d = Document::parse(source);
@@ -344,16 +351,30 @@ impl EditorDocument {
             return Err(EditError::InvalidSpan);
         }
         self.undo.push(self.source().to_owned());
+        if self.undo.len() > MAX_HISTORY {
+            self.undo.remove(0);
+        }
         self.redo.clear();
         let mut text = self.source().to_owned();
         text.replace_range(span.start..span.end, replacement);
-        self.document = parse_document(text, self.document.revision + 1, self.document.mode);
+        self.document = parse_document(
+            text,
+            self.document.revision.saturating_add(1),
+            self.document.mode,
+        );
         Ok(())
     }
     pub fn undo(&mut self) -> bool {
         if let Some(source) = self.undo.pop() {
             self.redo.push(self.source().to_owned());
-            self.document = parse_document(source, self.document.revision + 1, self.document.mode);
+            if self.redo.len() > MAX_HISTORY {
+                self.redo.remove(0);
+            }
+            self.document = parse_document(
+                source,
+                self.document.revision.saturating_add(1),
+                self.document.mode,
+            );
             true
         } else {
             false
@@ -362,7 +383,14 @@ impl EditorDocument {
     pub fn redo(&mut self) -> bool {
         if let Some(source) = self.redo.pop() {
             self.undo.push(self.source().to_owned());
-            self.document = parse_document(source, self.document.revision + 1, self.document.mode);
+            if self.undo.len() > MAX_HISTORY {
+                self.undo.remove(0);
+            }
+            self.document = parse_document(
+                source,
+                self.document.revision.saturating_add(1),
+                self.document.mode,
+            );
             true
         } else {
             false
@@ -425,18 +453,11 @@ fn parse_document(source: String, revision: u64, mode: ViewMode) -> Document {
                 j += 1;
             }
             let e = lines.get(j).map_or(source.len(), |x| x.0 + x.1.len());
-            let content_start = start
-                + line.len()
-                + if source
-                    .as_bytes()
-                    .get(start + line.len())
-                    .is_some_and(|x| *x == b'\n')
-                {
-                    1
-                } else {
-                    0
-                };
-            let content_end = lines.get(j).map_or(e, |x| x.0.saturating_sub(1));
+            let content_start =
+                start + line.len() + newline_width_after(&source, start + line.len());
+            let content_end = lines.get(j).map_or(e, |x| {
+                x.0.saturating_sub(newline_width_before(&source, x.0))
+            });
             blocks.push(Block::Code {
                 language,
                 value: source[content_start..content_end.min(source.len())].to_owned(),
@@ -445,14 +466,14 @@ fn parse_document(source: String, revision: u64, mode: ViewMode) -> Document {
             i = (j + 1).min(lines.len());
             continue;
         }
-        if let Some((level, text)) = heading(line) {
+        if let Some((level, text, text_offset)) = heading(line) {
             let e = start + line.len();
             let span = Span::new(start, e);
             blocks.push(Block::Heading {
                 level,
                 text: text.to_owned(),
                 slug: slugify(text),
-                children: parse_inlines(text, start + line.len() - text.len()),
+                children: parse_inlines(text, start + text_offset),
                 span,
             });
             i += 1;
@@ -460,31 +481,45 @@ fn parse_document(source: String, revision: u64, mode: ViewMode) -> Document {
         }
         if line.starts_with('>') {
             let mut j = i;
-            let mut inner = String::new();
+            let mut content_lines: Vec<(usize, &str)> = Vec::new();
             while j < lines.len() && lines[j].1.starts_with('>') {
-                inner.push_str(lines[j].1.trim_start_matches('>').trim_start());
-                inner.push('\n');
+                let after = &lines[j].1[1..];
+                let whitespace = after.len() - after.trim_start().len();
+                content_lines.push((lines[j].0 + 1 + whitespace, after.trim_start()));
                 j += 1;
             }
             let e = lines[j - 1].0 + lines[j - 1].1.len();
-            let callout = inner.lines().next().and_then(parse_callout);
+            let callout = content_lines
+                .first()
+                .and_then(|(_, text)| parse_callout(text));
             if let Some((kind, title, fold)) = callout {
-                let rest = inner.lines().skip(1).collect::<Vec<_>>().join("\n");
+                let body = &content_lines[1..];
+                let child_start = body.first().map_or(e, |x| x.0);
+                let child_end = body.last().map_or(child_start, |x| x.0 + x.1.len());
                 blocks.push(Block::Callout {
                     kind,
                     title,
                     foldable: fold,
                     children: vec![Block::Paragraph {
-                        children: parse_inlines(&rest, start),
-                        span: Span::new(start, e),
+                        children: body
+                            .iter()
+                            .flat_map(|(offset, text)| parse_inlines(text, *offset))
+                            .collect(),
+                        span: Span::new(child_start, child_end),
                     }],
                     span: Span::new(start, e),
                 });
             } else {
                 blocks.push(Block::Quote {
                     children: vec![Block::Paragraph {
-                        children: parse_inlines(&inner, start),
-                        span: Span::new(start, e),
+                        children: content_lines
+                            .iter()
+                            .flat_map(|(offset, text)| parse_inlines(text, *offset))
+                            .collect(),
+                        span: Span::new(
+                            content_lines.first().map_or(start, |x| x.0),
+                            content_lines.last().map_or(e, |x| x.0 + x.1.len()),
+                        ),
                     }],
                     span: Span::new(start, e),
                 });
@@ -492,25 +527,30 @@ fn parse_document(source: String, revision: u64, mode: ViewMode) -> Document {
             i = j;
             continue;
         }
-        if let Some((ordered, _item)) = list_marker(line) {
+        if let Some((ordered, _item, _)) = list_marker_at(line) {
             let mut items = Vec::new();
             let mut j = i;
             while j < lines.len() {
-                if let Some((o, t)) = list_marker(lines[j].1) {
+                if let Some((o, t, content_offset)) = list_marker_at(lines[j].1) {
                     if o != ordered {
                         break;
                     }
                     let checked = task_state(t);
+                    let task_prefix = if t.starts_with("[ ] ")
+                        || t.starts_with("[x] ")
+                        || t.starts_with("[X] ")
+                    {
+                        4
+                    } else {
+                        0
+                    };
+                    let content = &t[task_prefix..];
+                    let content_start = lines[j].0 + content_offset + task_prefix;
                     items.push(ListItem {
                         checked,
                         blocks: vec![Block::Paragraph {
-                            children: parse_inlines(
-                                t.trim_start_matches("[ ] ")
-                                    .trim_start_matches("[x] ")
-                                    .trim_start_matches("[X] "),
-                                lines[j].0,
-                            ),
-                            span: Span::new(lines[j].0, lines[j].0 + lines[j].1.len()),
+                            children: parse_inlines(content, content_start),
+                            span: Span::new(content_start, lines[j].0 + lines[j].1.len()),
                         }],
                         span: Span::new(lines[j].0, lines[j].0 + lines[j].1.len()),
                     });
@@ -587,28 +627,55 @@ fn parse_document(source: String, revision: u64, mode: ViewMode) -> Document {
 }
 
 fn parse_frontmatter(s: &str) -> (Option<Frontmatter>, usize) {
-    if !s.starts_with("---\n") && !s.starts_with("---\r\n") {
+    let mut lines = s.split_inclusive('\n').scan(0usize, |offset, raw| {
+        let start = *offset;
+        *offset += raw.len();
+        Some((
+            start,
+            raw.trim_end_matches('\n').trim_end_matches('\r'),
+            raw.len(),
+        ))
+    });
+    let Some((_, first, first_len)) = lines.next() else {
+        return (None, 0);
+    };
+    if first != "---" {
         return (None, 0);
     }
-    let close = s[4..].find("\n---").map(|x| x + 4);
-    let Some(pos) = close else { return (None, 0) };
-    let end = s[pos..].find('\n').map_or(s.len(), |x| pos + x + 1);
-    let raw = s[4..pos].trim_matches('\n').to_owned();
+    let mut close = None;
+    for (start, line, len) in lines {
+        if line == "---" {
+            close = Some((start, start + len));
+            break;
+        }
+    }
+    let Some((close_start, end)) = close else {
+        return (None, 0);
+    };
+    let raw_end = close_start.saturating_sub(
+        if s.as_bytes().get(close_start.wrapping_sub(1)) == Some(&b'\n') {
+            1
+        } else {
+            0
+        },
+    );
+    let raw = s[4..raw_end].trim_end_matches(['\r', '\n']).to_owned();
     let mut properties = Vec::new();
-    let mut at = 4;
-    for line in raw.lines() {
-        let len = line.len();
-        if let Some(k) = line.find(':') {
-            let key = line[..k].trim();
+    let mut at = first_len;
+    for line in s[first_len..raw_end].split_inclusive('\n') {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        let len = content.len();
+        if let Some(k) = content.find(':') {
+            let key = content[..k].trim();
             if !key.is_empty() {
                 properties.push(Property {
                     key: key.to_owned(),
-                    value: line[k + 1..].trim().to_owned(),
+                    value: content[k + 1..].trim().to_owned(),
                     span: Span::new(at, at + len),
                 });
             }
         }
-        at += len + 1;
+        at += line.len();
     }
     (
         Some(Frontmatter {
@@ -619,10 +686,28 @@ fn parse_frontmatter(s: &str) -> (Option<Frontmatter>, usize) {
         end,
     )
 }
-fn heading(line: &str) -> Option<(u8, &str)> {
+fn newline_width_after(source: &str, at: usize) -> usize {
+    match source.as_bytes().get(at..at + 2) {
+        Some(b"\r\n") => 2,
+        Some(b"\n\n") => 1,
+        _ => 0,
+    }
+}
+fn newline_width_before(source: &str, at: usize) -> usize {
+    if at >= 2 && &source.as_bytes()[at - 2..at] == b"\r\n" {
+        2
+    } else if at >= 1 && source.as_bytes()[at - 1] == b'\n' {
+        1
+    } else {
+        0
+    }
+}
+fn heading(line: &str) -> Option<(u8, &str, usize)> {
     let n = line.bytes().take_while(|b| *b == b'#').count();
     if (1..=6).contains(&n) && line.as_bytes().get(n) == Some(&b' ') {
-        Some((n as u8, line[n + 1..].trim()))
+        let rest = &line[n + 1..];
+        let leading = rest.len() - rest.trim_start().len();
+        Some((n as u8, rest.trim(), n + 1 + leading))
     } else {
         None
     }
@@ -650,6 +735,12 @@ fn list_marker(s: &str) -> Option<(bool, &str)> {
     } else {
         None
     }
+}
+fn list_marker_at(s: &str) -> Option<(bool, &str, usize)> {
+    let leading = s.len() - s.trim_start().len();
+    let t = &s[leading..];
+    let (ordered, content) = list_marker(s)?;
+    Some((ordered, content, leading + t.len() - content.len()))
 }
 fn task_state(s: &str) -> Option<bool> {
     if s.starts_with("[ ] ") {
@@ -684,16 +775,22 @@ fn parse_callout(s: &str) -> Option<(String, Option<String>, Option<bool>)> {
     Some((kind, (!title.is_empty()).then(|| title.to_owned()), fold))
 }
 fn extract_footnotes(s: &str, base: usize) -> Vec<(String, String, Span)> {
-    s.lines()
-        .enumerate()
-        .filter_map(|(n, l)| {
+    let mut offset = 0;
+    s.split_inclusive('\n')
+        .filter_map(|raw| {
+            let l = raw.trim_end_matches('\n').trim_end_matches('\r');
+            let line_start = base + offset;
+            offset += raw.len();
             let rest = l.strip_prefix("[^")?;
             let k = rest.find("]: ")?;
+            if rest[..k].is_empty() || rest[..k].contains(|c: char| c.is_whitespace() || c == ']') {
+                return None;
+            }
             let label = &rest[..k];
             Some((
                 label.to_owned(),
                 rest[k + 3..].to_owned(),
-                Span::new(base + n, base + n + l.len()),
+                Span::new(line_start, line_start + l.len()),
             ))
         })
         .collect()
@@ -715,15 +812,17 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
             });
         }
         let r = &s[p..];
-        if r.starts_with("![[") || r.starts_with("![[") {
+        if r.starts_with("![[") {
             if let Some(e) = r[3..].find("]]") {
                 let e = p + 3 + e;
                 let (target, alias) = split_target(&s[p + 3..e]);
-                out.push(Inline::Embed {
-                    target,
-                    alias,
-                    span: Span::new(base + p, base + e + 2),
-                });
+                if !target.trim().is_empty() {
+                    out.push(Inline::Embed {
+                        target,
+                        alias,
+                        span: Span::new(base + p, base + e + 2),
+                    });
+                }
                 i = e + 2;
                 text_start = i;
                 continue;
@@ -791,33 +890,40 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
         }
         if r.starts_with("[^") {
             if let Some(e) = r.find(']') {
-                out.push(Inline::FootnoteRef {
-                    label: r[2..e].to_owned(),
-                    span: Span::new(base + p, base + p + e + 1),
-                });
-                i = p + e + 1;
-                text_start = i;
-                continue;
+                let label = &r[2..e];
+                if !label.is_empty() && !label.contains(|c: char| c.is_whitespace() || c == ']') {
+                    out.push(Inline::FootnoteRef {
+                        label: label.to_owned(),
+                        span: Span::new(base + p, base + p + e + 1),
+                    });
+                    i = p + e + 1;
+                    text_start = i;
+                    continue;
+                }
             }
         }
         if r.starts_with('[') {
             if let Some(mid) = r.find("](") {
                 if let Some(e) = r[mid + 2..].find(')') {
                     let e = p + mid + 2 + e;
-                    out.push(Inline::Link {
-                        label: s[p + 1..p + mid].to_owned(),
-                        target: s[p + mid + 2..e].to_owned(),
-                        span: Span::new(base + p, base + e + 1),
-                    });
-                    i = e + 1;
-                    text_start = i;
-                    continue;
+                    let label = &s[p + 1..p + mid];
+                    let target = &s[p + mid + 2..e];
+                    if !label.is_empty() && !target.is_empty() && !target.contains(['\n', '\r']) {
+                        out.push(Inline::Link {
+                            label: label.to_owned(),
+                            target: target.to_owned(),
+                            span: Span::new(base + p, base + e + 1),
+                        });
+                        i = e + 1;
+                        text_start = i;
+                        continue;
+                    }
                 }
             }
         }
         if r.starts_with('#') && (p == 0 || s.as_bytes()[p - 1].is_ascii_whitespace()) {
             let e = r.find(|c: char| c.is_whitespace()).unwrap_or(r.len());
-            if e > 1 {
+            if e > 1 && valid_tag(&r[1..e]) {
                 out.push(Inline::Tag {
                     value: r[1..e].to_owned(),
                     span: Span::new(base + p, base + p + e),
@@ -837,6 +943,12 @@ fn parse_inlines(s: &str, base: usize) -> Vec<Inline> {
         });
     }
     out
+}
+fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
 }
 fn split_target(s: &str) -> (String, Option<String>) {
     s.split_once('|').map_or((s.to_owned(), None), |(a, b)| {
@@ -896,10 +1008,17 @@ fn collect_headings(blocks: &[Block], out: &mut Vec<HeadingInfo>) {
     }
 }
 fn find_block_id(source: &str, id: &str) -> Option<Span> {
-    source.lines().enumerate().find_map(|(n, l)| {
-        l.contains(&format!("^{}", id)).then_some(Span::new(
-            source[..source.lines().take(n).map(str::len).sum::<usize>() + n].len(),
-            source[..source.lines().take(n).map(str::len).sum::<usize>() + n].len() + l.len(),
-        ))
+    if id.is_empty() {
+        return None;
+    }
+    let needle = format!("^{}", id);
+    let mut offset = 0;
+    source.split_inclusive('\n').find_map(|raw| {
+        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
+        let start = offset;
+        offset += raw.len();
+        line.split_whitespace()
+            .any(|part| part == needle)
+            .then_some(Span::new(start, start + line.len()))
     })
 }
