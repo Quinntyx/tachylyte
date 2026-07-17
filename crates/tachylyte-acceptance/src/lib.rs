@@ -21,6 +21,7 @@ mod tests {
 
     const HOME: &str = include_str!("../fixtures/Home.md");
     const PROJECT: &str = include_str!("../fixtures/Projects/River.md");
+    const UNRESOLVED: &str = include_str!("../fixtures/Unresolved.md");
     const CANVAS: &str = include_str!("../fixtures/Planning.canvas");
     const BASE: &str = include_str!("../fixtures/Projects.base");
 
@@ -44,6 +45,12 @@ mod tests {
             .unwrap();
         vault
             .write(&VaultPath::new("Projects.base").unwrap(), BASE.as_bytes())
+            .unwrap();
+        vault
+            .write(
+                &VaultPath::new("Unresolved.md").unwrap(),
+                UNRESOLVED.as_bytes(),
+            )
             .unwrap();
         (dir, vault)
     }
@@ -87,6 +94,37 @@ mod tests {
         assert!(editor.undo());
     }
 
+    #[test]
+    fn edit_save_reindex_search_and_backlinks_use_new_link_target() {
+        let (_dir, vault) = vault();
+        let path = VaultPath::new("Home.md").unwrap();
+        let source = String::from_utf8(vault.read(&path).unwrap()).unwrap();
+        let parsed = MarkdownDocument::parse(source);
+        let mut editor = EditorDocument::new(parsed.source());
+        let link_span = editor.document().wikilinks()[0].span;
+        editor.edit(link_span, "[[Unresolved]]").unwrap();
+        vault.write(&path, editor.source().as_bytes()).unwrap();
+
+        let reparsed =
+            MarkdownDocument::parse(String::from_utf8(vault.read(&path).unwrap()).unwrap());
+        let mut reindexed = VaultIndex::new();
+        reindexed.upsert(Document {
+            path: "Home.md".into(),
+            content: reparsed.source().into(),
+            ..Default::default()
+        });
+        reindexed.upsert(Document {
+            path: "Unresolved.md".into(),
+            content: UNRESOLVED.into(),
+            ..Default::default()
+        });
+        assert!(search(&reindexed, "content:Unresolved")
+            .unwrap()
+            .iter()
+            .any(|result| result.path == "Home.md"));
+        assert_eq!(backlinks(&reindexed, "Unresolved.md")[0].source, "Home.md");
+    }
+
     fn index() -> VaultIndex {
         let mut index = VaultIndex::new();
         index.upsert(Document {
@@ -108,6 +146,12 @@ mod tests {
             properties: BTreeMap::new(),
             tasks: vec![],
         });
+        index.upsert(Document {
+            path: "Unresolved.md".into(),
+            content: UNRESOLVED.into(),
+            modified: 3,
+            ..Default::default()
+        });
         index
     }
 
@@ -125,10 +169,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(nodes.len(), 2);
+        assert!(nodes
+            .iter()
+            .any(|node| node.id == "unresolved:Missing Note" && node.unresolved));
         assert!(edges
             .iter()
             .any(|e| e.from == "Home.md" && e.to == "Projects/River.md"));
+        assert!(edges
+            .iter()
+            .any(|e| e.to == "unresolved:Missing Note" && e.unresolved));
     }
 
     struct SafeAdapter<'a> {
@@ -136,18 +185,46 @@ mod tests {
         snapshots: Vec<Snapshot>,
     }
     impl SafeAdapter<'_> {
-        fn apply_daily(&self, plan: &tachylyte_workflows::DailyNotePlan) {
+        fn apply_daily(&self, plan: &tachylyte_workflows::DailyNotePlan) -> Result<(), String> {
+            tachylyte_workflows::safe_path(&plan.path).map_err(|error| error.to_string())?;
             if plan.create {
+                let content = plan
+                    .content
+                    .as_deref()
+                    .ok_or("create plan has no content")?;
                 self.vault
                     .create(
-                        &VaultPath::new(&plan.path).unwrap(),
-                        plan.content.as_deref().unwrap_or("").as_bytes(),
+                        &VaultPath::new(&plan.path).map_err(|error| error.to_string())?,
+                        content.as_bytes(),
                     )
-                    .unwrap();
+                    .map_err(|error| error.to_string())?;
             }
+            Ok(())
         }
-        fn apply_recovery(&mut self, plan: RecoveryPlan) {
+        fn apply_recovery(&mut self, plan: RecoveryPlan) -> Result<Vec<u64>, String> {
+            for snapshot in &plan.retain {
+                let path = VaultPath::new(format!("recovery/{}.snapshot", snapshot.revision))
+                    .map_err(|error| error.to_string())?;
+                if self.vault.read(&path).map_err(|error| error.to_string())?
+                    != snapshot.content.as_bytes()
+                {
+                    return Err(format!(
+                        "snapshot {} content precondition failed",
+                        snapshot.revision
+                    ));
+                }
+            }
+            let mut deleted = Vec::new();
+            for revision in &plan.delete {
+                let path = VaultPath::new(format!("recovery/{}.snapshot", revision))
+                    .map_err(|error| error.to_string())?;
+                self.vault
+                    .delete(&path)
+                    .map_err(|error| error.to_string())?;
+                deleted.push(*revision);
+            }
             self.snapshots = plan.retain;
+            Ok(deleted)
         }
     }
 
@@ -163,13 +240,28 @@ mod tests {
             date_format: "%Y-%m-%d".into(),
             template: None,
         };
-        let plan = daily_note_plan(
+        let registry = tachylyte_workflows::FeatureRegistry::new(["daily-notes"]);
+        let service = tachylyte_workflows::WorkflowService::new(registry);
+        let plan = service
+            .daily_note(
+                &config,
+                now,
+                &BTreeSet::new(),
+                Some("---\ntags: daily\n---\n# {{title}} at {{time}}\n"),
+            )
+            .unwrap();
+        assert_eq!(
+            plan.content.as_deref(),
+            Some("---\ntags: daily\n---\n# 2024-06-07 at 09:30\n")
+        );
+        let direct_plan = daily_note_plan(
             &config,
             now,
             &BTreeSet::new(),
             Some("---\ntags: daily\n---\n# {{title}} at {{time}}\n"),
         )
         .unwrap();
+        assert_eq!(plan, direct_plan);
         assert_eq!(plan.path, "Daily/2024-06-07.md");
         assert_eq!(
             render_template("{{title}} {{date}}", now, "Standup", "x").unwrap(),
@@ -179,8 +271,16 @@ mod tests {
             vault: &vault,
             snapshots: Vec::new(),
         };
-        adapter.apply_daily(&plan);
+        adapter.apply_daily(&plan).unwrap();
         assert!(vault.read(&VaultPath::new(&plan.path).unwrap()).is_ok());
+        for revision in 1..=3 {
+            vault
+                .create(
+                    &VaultPath::new(format!("recovery/{revision}.snapshot")).unwrap(),
+                    revision.to_string().as_bytes(),
+                )
+                .unwrap();
+        }
         let snapshots = (1..=3)
             .map(|revision| Snapshot {
                 revision,
@@ -188,7 +288,19 @@ mod tests {
                 content: revision.to_string(),
             })
             .collect();
-        adapter.apply_recovery(retention_plan(snapshots, 2));
+        let deleted = adapter
+            .apply_recovery(retention_plan(snapshots, 2))
+            .unwrap();
+        assert_eq!(deleted, vec![1]);
+        assert!(vault
+            .read(&VaultPath::new("recovery/1.snapshot").unwrap())
+            .is_err());
+        assert_eq!(
+            vault
+                .read(&VaultPath::new("recovery/2.snapshot").unwrap())
+                .unwrap(),
+            b"2"
+        );
         assert_eq!(adapter.snapshots.len(), 2);
         assert_eq!(Sha256Digest::of("stable"), Sha256Digest::of("stable"));
     }
@@ -199,9 +311,42 @@ mod tests {
         canvas
             .move_node("brief", Point { x: 40.0, y: 30.0 })
             .unwrap();
-        assert!(canvas.to_json().unwrap().contains("vendorCanvasExtension"));
+        let (_dir, vault) = vault();
+        vault
+            .write(
+                &VaultPath::new("Planning.canvas").unwrap(),
+                canvas.to_json().unwrap().as_bytes(),
+            )
+            .unwrap();
+        let reloaded_canvas = CanvasDocument::from_json(
+            std::str::from_utf8(
+                &vault
+                    .read(&VaultPath::new("Planning.canvas").unwrap())
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reloaded_canvas.node("brief").unwrap().x, 40.0);
         let base = BaseDocument::from_yaml(BASE).unwrap();
-        assert!(base.to_yaml().unwrap().contains("future-view-key"));
+        vault
+            .write(
+                &VaultPath::new("Projects.base").unwrap(),
+                base.to_yaml().unwrap().as_bytes(),
+            )
+            .unwrap();
+        assert!(BaseDocument::from_yaml(
+            std::str::from_utf8(
+                &vault
+                    .read(&VaultPath::new("Projects.base").unwrap())
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .to_yaml()
+        .unwrap()
+        .contains("future-view-key"));
     }
 
     #[test]
@@ -229,6 +374,20 @@ mod tests {
         let mut restored = Workspace::default();
         restored.dispatch(Action::Restore(encoded));
         assert!(restored.validate());
+        let mut disabled = tachylyte_workflows::FeatureRegistry::new(["note-composer"]);
+        disabled.set_enabled("note-composer", false);
+        let gated = tachylyte_workflows::WorkflowService::new(disabled);
+        assert!(gated
+            .compose_note(
+                "x",
+                None,
+                "body",
+                FixedOffset::east_opt(0)
+                    .unwrap()
+                    .with_ymd_and_hms(2024, 1, 1, 0, 0, 0)
+                    .unwrap(),
+            )
+            .is_err());
     }
 
     #[test]

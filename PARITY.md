@@ -13,7 +13,7 @@ corresponding implementation.
 | File explorer | Implemented | `vault_scan_read_write_rename_and_trash_are_composable` |
 | Global search | Implemented | `index_search_backlinks_and_graph_share_link_resolution` |
 | Quick switcher | Model-only | `tachylyte-knowledge::quick_switch`; no acceptance UI |
-| Graph view | Implemented | `index_search_backlinks_and_graph_share_link_resolution` |
+| Graph view | Model-only | `index_search_backlinks_and_graph_share_link_resolution` proves graph nodes/edges, including unresolved nodes; no graph renderer |
 | Backlinks | Implemented | same test, `backlinks` public API |
 | Outgoing links | Implemented | same test, `links` public API |
 | Tags view | Model-only | `tachylyte-knowledge::tag_counts`; no acceptance view |
@@ -27,7 +27,7 @@ corresponding implementation.
 | Canvas | Implemented | `canvas_and_base_fixtures_round_trip_with_extensions` |
 | Bookmarks | Model-only | `tachylyte-knowledge::Bookmark` roundtrip unit coverage; no acceptance UI |
 | Workspaces | Implemented | `workspace_layout_roundtrip_and_feature_disable_are_observable` |
-| File recovery | Implemented | `daily_template_and_recovery_plans_apply_through_safe_adapter`; retention plan applied by adapter |
+| File recovery | Model-only | `daily_template_and_recovery_plans_apply_through_safe_adapter` applies persisted snapshot retain/delete ordering through a test adapter; no runtime recovery service |
 | Audio recorder | Model-only | `tachylyte-workflows::audio_start` / transition tests; no capture device |
 | Unique note creator | Model-only | `tachylyte-workflows::unique_note_plan`; no acceptance flow |
 | Random note | Model-only | `tachylyte-knowledge::random_note`; deterministic selection only |
@@ -50,10 +50,10 @@ corresponding implementation.
 | Markdown editing, undo and reparse | Implemented | `markdown_edit_save_and_reparse_preserves_semantics` |
 | Wiki-links, embeds, headings, tags, frontmatter and tasks | Implemented | Markdown fixture plus parse assertions; embeds are API-level only here |
 | Search query language and ranked snippets | Implemented | `index_search_backlinks_and_graph_share_link_resolution` |
-| Backlink/outgoing-link resolution and unresolved graph nodes | Implemented | same acceptance test; graph rendering is not included |
+| Backlink/outgoing-link resolution and unresolved graph nodes | Implemented | acceptance tests prove reindex/backlinks and unresolved node/edge data; graph rendering is not included |
 | Canvas node geometry, edges and extension preservation | Implemented | `canvas_and_base_fixtures_round_trip_with_extensions` |
 | Bases records/formulas/filter/sort | Model-only | Structured crate public APIs and its tests; acceptance checks YAML fidelity only |
-| Workspace split/tab/popout/sidebar layout | Model-only | Workspace reducer APIs; acceptance checks roundtrip/feature disable, not GPUI interaction |
+| Workspace split/tab/popout/sidebar layout | Model-only | Workspace reducer APIs; acceptance checks roundtrip/feature disable, not GPUI interaction or app/runtime UI |
 | Themes, appearance and CSS customization | Model-only | Workspace appearance data model; no CSS/theme loader or renderer |
 | Feature toggles and disabled commands/views | Implemented | `workspace_layout_roundtrip_and_feature_disable_are_observable` |
 | Commands, hotkeys and menus | Model-only | Workspace reducer models; no OS/global shortcut registration |
@@ -63,9 +63,16 @@ corresponding implementation.
 | OS notifications, clipboard, drag/drop, printing and media capture | Missing | No platform adapter in this test-only crate |
 | Plugin installation, execution and third-party sandbox | Missing | Core feature registry is not a JavaScript plugin runtime |
 
+The acceptance crate is test-only: it does not claim the Tachylyte app/runtime
+has Obsidian's desktop renderer, graph/canvas interaction, plugin host, or OS
+integration. Where a test adapter applies a plan, that is evidence of the
+plan's public contract only.
+
 ## Acceptance fixture inventory
 
 `fixtures/Home.md` and `fixtures/Projects/River.md` provide frontmatter, tags,
-tasks, headings and links. `fixtures/Planning.canvas` includes a file node,
+ tasks, headings and links. `fixtures/Unresolved.md` intentionally links to a
+ missing note and is used to prove unresolved graph-node behavior.
+`fixtures/Planning.canvas` includes a file node,
 edge, and unknown extension fields. `fixtures/Projects.base` includes a view,
 sort configuration, and an unknown view key to make roundtrip fidelity visible.
