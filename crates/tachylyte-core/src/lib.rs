@@ -144,73 +144,48 @@ impl Vault {
         &self.root
     }
     fn checked(&self, p: &VaultPath, write: bool) -> Result<PathBuf, CoreError> {
-        // Linux operations are first anchored to an O_PATH-like capability and
-        // openat2's BENEATH|NO_SYMLINKS resolution. This is not a process-wide
-        // mutex: replacing a directory or symlink concurrently cannot redirect
-        // the capability lookup outside the vault. Other platforms retain the
-        // lexical/symlink checks below; callers should treat those platforms as
-        // lacking hostile concurrent-directory guarantees.
+        // Linux callers perform all existence and symlink checks through the
+        // retained capability; this function is intentionally lexical only.
         #[cfg(target_os = "linux")]
         {
-            let relative = if write {
-                p.as_path().parent().unwrap_or(Path::new("."))
-            } else {
-                p.as_path()
-            };
-            let flags = OFlags::PATH
-                | if write {
-                    OFlags::DIRECTORY
-                } else {
-                    OFlags::empty()
-                };
-            let checked = openat2(
-                &*self.root_cap,
-                relative,
-                flags,
-                Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-            );
-            if let Err(e) = checked {
-                if !(write && e.raw_os_error() == 2) {
-                    return Err(io_at(
-                        &self.root,
-                        io::Error::from_raw_os_error(e.raw_os_error()),
-                    ));
+            let _ = write;
+            Ok(self.root.join(p.as_path()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let full = self.root.join(p.as_path());
+            let mut current = self.root.clone();
+            let components: Vec<_> = p.as_path().components().collect();
+            for (i, c) in components.iter().enumerate() {
+                current.push(c.as_os_str());
+                if let Ok(meta) = fs::symlink_metadata(&current) {
+                    if meta.file_type().is_symlink() {
+                        return Err(CoreError::Symlink(current));
+                    }
+                    if write && i + 1 < components.len() && !meta.is_dir() {
+                        return Err(io_at(
+                            &current,
+                            io::Error::from(io::ErrorKind::NotADirectory),
+                        ));
+                    }
+                } else if write {
+                    break;
                 }
             }
-        }
-        let full = self.root.join(p.as_path());
-        let mut current = self.root.clone();
-        let components: Vec<_> = p.as_path().components().collect();
-        for (i, c) in components.iter().enumerate() {
-            current.push(c.as_os_str());
-            if let Ok(meta) = fs::symlink_metadata(&current) {
-                if meta.file_type().is_symlink() {
-                    return Err(CoreError::Symlink(current));
+            if !write {
+                let canonical = fs::canonicalize(&full).map_err(|e| {
+                    if e.kind() == io::ErrorKind::NotFound {
+                        CoreError::NotFound(p.0.clone())
+                    } else {
+                        io_at(&full, e)
+                    }
+                })?;
+                if canonical.strip_prefix(&self.root).is_err() {
+                    return Err(CoreError::Escape(p.to_string()));
                 }
-                if write && i + 1 < components.len() && !meta.is_dir() {
-                    return Err(io_at(
-                        &current,
-                        io::Error::from(io::ErrorKind::NotADirectory),
-                    ));
-                }
-            } else if write {
-                break;
             }
+            Ok(full)
         }
-        if !write {
-            let canonical = fs::canonicalize(&full).map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    CoreError::NotFound(p.0.clone())
-                } else {
-                    io_at(&full, e)
-                }
-            })?;
-            if canonical.strip_prefix(&self.root).is_err() {
-                return Err(CoreError::Escape(p.to_string()));
-            }
-        }
-        Ok(full)
     }
     /// Read UTF-8 bytes from a vault file.
     pub fn read(&self, path: &VaultPath) -> Result<Vec<u8>, CoreError> {
@@ -468,11 +443,6 @@ impl Vault {
         {
             let from = self.checked(path, false)?;
             let dir_path = self.root.join(".trash");
-            if let Ok(meta) = fs::symlink_metadata(&dir_path) {
-                if meta.file_type().is_symlink() {
-                    return Err(CoreError::Symlink(dir_path));
-                }
-            }
             let name = path
                 .as_path()
                 .file_name()
@@ -715,10 +685,14 @@ fn linux_parent_mut<'a>(
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
         )
         .map_err(|e| {
-            io_at(
-                path.as_path(),
-                io::Error::from_raw_os_error(e.raw_os_error()),
-            )
+            if e.raw_os_error() == 40 {
+                CoreError::Symlink(path.as_path().to_path_buf())
+            } else {
+                io_at(
+                    path.as_path(),
+                    io::Error::from_raw_os_error(e.raw_os_error()),
+                )
+            }
         })?;
     }
     Err(CoreError::InvalidPath(path.to_string()))
