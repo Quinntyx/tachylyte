@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Document {
     pub path: String,
     pub content: String,
+    /// Caller-supplied monotonic timestamp used by navigation sorting.
+    pub modified: u64,
     pub tags: Vec<String>,
     pub properties: BTreeMap<String, String>,
     pub tasks: Vec<Task>,
@@ -30,13 +32,16 @@ impl VaultIndex {
         self.revision
     }
     pub fn upsert(&mut self, document: Document) -> u64 {
-        self.docs.insert(document.path.clone(), document);
-        self.revision += 1;
+        if self.docs.get(&document.path) != Some(&document) {
+            self.docs.insert(document.path.clone(), document);
+            self.revision += 1;
+        }
         self.revision
     }
     pub fn remove(&mut self, path: &str) -> u64 {
-        self.docs.remove(path);
-        self.revision += 1;
+        if self.docs.remove(path).is_some() {
+            self.revision += 1;
+        }
         self.revision
     }
     pub fn get(&self, path: &str) -> Option<&Document> {
@@ -70,50 +75,43 @@ pub struct QueryError {
 }
 
 pub fn parse_query(input: &str) -> Result<Query, QueryError> {
-    let mut tokens = Vec::new();
-    let mut start = None;
-    let mut quote = false;
-    for (i, c) in input.char_indices() {
-        if c == '"' {
-            quote = !quote;
-            if start.is_none() {
-                start = Some(i + 1);
-            }
-        } else if c.is_whitespace() && !quote {
-            if let Some(s) = start.take() {
-                tokens.push(input[s..i].to_string());
-            }
-        } else if start.is_none() {
-            start = Some(i);
-        }
-    }
-    if quote {
-        return Err(QueryError {
-            message: "unterminated quote".into(),
-            position: input.len(),
-        });
-    }
-    if let Some(s) = start {
-        tokens.push(input[s..].trim_end_matches('"').to_string());
-    }
+    let tokens = tokenize(input)?;
     if tokens.is_empty() {
         return Ok(Query::Term(String::new()));
     }
     let mut groups: Vec<Vec<Query>> = vec![Vec::new()];
     let mut is_or = false;
-    for raw in tokens {
-        if raw.eq_ignore_ascii_case("OR") {
+    for (raw, quoted) in tokens {
+        if !quoted && raw.eq_ignore_ascii_case("OR") {
+            if groups.last().is_none_or(Vec::is_empty) {
+                return Err(QueryError {
+                    message: "empty OR group".into(),
+                    position: input.len(),
+                });
+            }
             is_or = true;
             groups.push(Vec::new());
             continue;
         }
         let neg = raw.starts_with('-');
         let raw = if neg { &raw[1..] } else { &raw[..] };
+        if raw.is_empty() {
+            return Err(QueryError {
+                message: "bare negation".into(),
+                position: 0,
+            });
+        }
         let q = parse_atom(raw)?;
         groups
             .last_mut()
             .unwrap()
             .push(if neg { Query::Not(Box::new(q)) } else { q });
+    }
+    if is_or && groups.last().is_none_or(Vec::is_empty) {
+        return Err(QueryError {
+            message: "empty OR group".into(),
+            position: input.len(),
+        });
     }
     let parts = groups
         .into_iter()
@@ -132,6 +130,45 @@ pub fn parse_query(input: &str) -> Result<Query, QueryError> {
     } else {
         Ok(Query::And(parts))
     }
+}
+
+fn tokenize(input: &str) -> Result<Vec<(String, bool)>, QueryError> {
+    let mut result = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut had_quote = false;
+    let mut escaped = false;
+    for (position, ch) in input.char_indices() {
+        if escaped {
+            token.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+            had_quote = true;
+        } else if ch.is_whitespace() && !quoted {
+            if !token.is_empty() {
+                result.push((std::mem::take(&mut token), had_quote));
+                had_quote = false;
+            }
+        } else {
+            token.push(ch);
+        }
+        if position + ch.len_utf8() == input.len() && quoted {
+            return Err(QueryError {
+                message: "unterminated quote".into(),
+                position: input.len(),
+            });
+        }
+    }
+    if escaped {
+        token.push('\\');
+    }
+    if !token.is_empty() {
+        result.push((token, had_quote));
+    }
+    Ok(result)
 }
 fn parse_atom(raw: &str) -> Result<Query, QueryError> {
     let (key, value) = raw.split_once(':').unwrap_or(("", raw));
@@ -180,46 +217,75 @@ pub struct SearchResult {
 }
 pub fn search(index: &VaultIndex, query: &str) -> Result<Vec<SearchResult>, QueryError> {
     let q = parse_query(query)?;
-    let needle = query.to_lowercase();
+    let terms = positive_terms(&q);
     let mut out = index
         .documents()
         .filter(|d| matches_query(&q, d))
         .map(|d| {
-            let score = relevance(d, &needle);
+            let score = relevance(d, &terms);
             SearchResult {
                 path: d.path.clone(),
                 score,
-                snippet: snippet(&d.content, &needle),
+                snippet: snippet(&d.content, terms.first().map_or("", |(_, value)| value)),
             }
         })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
     Ok(out)
 }
-fn relevance(d: &Document, q: &str) -> u32 {
-    let mut n = 0;
-    if d.path.to_lowercase().contains(q) {
-        n += 30;
+fn positive_terms(query: &Query) -> Vec<(u8, String)> {
+    match query {
+        Query::Not(_) => Vec::new(),
+        Query::And(xs) | Query::Or(xs) => xs.iter().flat_map(positive_terms).collect(),
+        Query::Term(x) => vec![(0, x.clone())],
+        Query::Path(x) => vec![(1, x.clone())],
+        Query::File(x) => vec![(2, x.clone())],
+        Query::Content(x) | Query::Tag(x) | Query::Property(_, x) => vec![(0, x.clone())],
+        Query::Task(_) => Vec::new(),
     }
-    n + d.content.to_lowercase().matches(q).count() as u32 * 10
+}
+fn relevance(d: &Document, terms: &[(u8, String)]) -> u32 {
+    terms
+        .iter()
+        .map(|(kind, term)| {
+            let value = match kind {
+                1 => &d.path,
+                2 => d.path.rsplit('/').next().unwrap_or(&d.path),
+                _ => &d.content,
+            };
+            let needle = term.to_lowercase();
+            let mut score = value.to_lowercase().matches(&needle).count() as u32 * 10;
+            if *kind == 1 && d.path.to_lowercase().contains(&needle) {
+                score += 30;
+            }
+            score
+        })
+        .sum()
 }
 pub fn snippet(text: &str, query: &str) -> String {
     let q = query.split_whitespace().next().unwrap_or("").to_lowercase();
     if q.is_empty() {
         return text.chars().take(160).collect();
     }
-    let low = text.to_lowercase();
-    let at = low.find(&q).unwrap_or(0);
+    let (low, starts, ends) = folded_with_boundaries(text);
+    let folded_start = low.find(&q).unwrap_or(0);
+    let folded_end = folded_start + q.len();
+    let at = starts.get(folded_start).copied().unwrap_or(0);
+    let end_match = folded_end
+        .checked_sub(1)
+        .and_then(|i| ends.get(i))
+        .copied()
+        .unwrap_or(text.len());
     let start = text[..at]
         .char_indices()
         .rev()
         .nth(40)
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let end = text[at..]
+    let end = text[end_match..]
         .char_indices()
         .nth(120)
-        .map(|(i, _)| at + i)
+        .map(|(i, _)| end_match + i)
         .unwrap_or(text.len());
     format!(
         "{}{}{}",
@@ -227,6 +293,22 @@ pub fn snippet(text: &str, query: &str) -> String {
         &text[start..end],
         if end < text.len() { "…" } else { "" }
     )
+}
+
+fn folded_with_boundaries(text: &str) -> (String, Vec<usize>, Vec<usize>) {
+    let mut folded = String::new();
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        for lowered in ch.to_lowercase() {
+            let bytes = lowered.len_utf8();
+            starts.extend(std::iter::repeat_n(start, bytes));
+            ends.extend(std::iter::repeat_n(end, bytes));
+            folded.push(lowered);
+        }
+    }
+    (folded, starts, ends)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,13 +321,16 @@ pub struct Link {
 pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
     let mut out = Vec::new();
     if let Some(d) = index.get(source) {
-        for word in d.content.split_whitespace().filter(|x| x.starts_with("[[")) {
-            let target = word
-                .trim_matches(|c: char| "[ ]],.!?".contains(c))
-                .split('|')
-                .next()
-                .unwrap_or("")
-                .to_string();
+        let mut rest = d.content.as_str();
+        while let Some(open) = rest.find("[[") {
+            let after_open = &rest[open + 2..];
+            let Some(close) = after_open.find("]]") else {
+                break;
+            };
+            let raw = &after_open[..close];
+            let mut fields = raw.splitn(2, '|');
+            let target = fields.next().unwrap_or("").trim().to_string();
+            let alias = fields.next().map(|x| x.trim().to_string());
             let resolved = index.get(&target).is_some()
                 || index
                     .documents()
@@ -253,12 +338,10 @@ pub fn links(index: &VaultIndex, source: &str) -> Vec<Link> {
             out.push(Link {
                 source: source.into(),
                 target,
-                alias: word
-                    .split('|')
-                    .nth(1)
-                    .map(|x| x.trim_end_matches("]]").into()),
+                alias,
                 resolved,
             });
+            rest = &after_open[close + 2..];
         }
     }
     out.sort_by(|a, b| a.target.cmp(&b.target));
@@ -380,24 +463,41 @@ pub fn graph(index: &VaultIndex, filter: &GraphFilter) -> (Vec<GraphNode>, Vec<G
         .documents()
         .map(|d| GraphNode {
             id: d.path.clone(),
-            group: None,
+            group: d.path.split('/').next().map(str::to_string),
         })
         .collect::<Vec<_>>();
+    ns.retain(|n| {
+        filter.groups.is_empty() || n.group.as_ref().is_some_and(|g| filter.groups.contains(g))
+    });
+    if let Some(q) = &filter.query {
+        ns.retain(|n| n.id.to_lowercase().contains(&q.to_lowercase()));
+    }
+    let node_ids = ns.iter().map(|n| n.id.as_str()).collect::<BTreeSet<_>>();
     let mut es = Vec::new();
     for d in index.documents() {
         for l in links(index, &d.path) {
             if !l.resolved && !filter.include_unresolved {
                 continue;
             }
+            if !node_ids.contains(d.path.as_str()) {
+                continue;
+            }
+            let target = if l.resolved {
+                ns.iter()
+                    .find(|n| n.id == l.target || n.id.file_stem() == Some(l.target.as_str()))
+                    .map(|n| n.id.clone())
+            } else {
+                Some(l.target.clone())
+            };
+            if target.is_none() {
+                continue;
+            }
             es.push(GraphEdge {
                 from: d.path.clone(),
-                to: l.target,
+                to: target.unwrap(),
                 unresolved: !l.resolved,
             });
         }
-    }
-    if let Some(q) = &filter.query {
-        ns.retain(|n| n.id.to_lowercase().contains(&q.to_lowercase()));
     }
     ns.sort_by(|a, b| a.id.cmp(&b.id));
     es.sort_by(|a, b| a.from.cmp(&b.from).then(a.to.cmp(&b.to)));
@@ -486,16 +586,17 @@ pub enum Sort {
     Modified,
 }
 pub fn explore(index: &VaultIndex, prefix: &str, sort: Sort) -> Vec<String> {
-    let mut x = index
+    let mut docs = index
         .documents()
         .filter(|d| d.path.starts_with(prefix))
-        .map(|d| d.path.clone())
         .collect::<Vec<_>>();
     match sort {
-        Sort::Name => x.sort(),
-        Sort::Modified => x.sort(),
+        Sort::Name => docs.sort_by(|a, b| a.path.cmp(&b.path)),
+        Sort::Modified => {
+            docs.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)))
+        }
     };
-    x
+    docs.into_iter().map(|d| d.path.clone()).collect()
 }
 
 #[cfg(test)]
@@ -507,6 +608,31 @@ mod tests {
             content: content.into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn unicode_case_expansion_snippet_is_safe() {
+        let result = snippet("İstanbul notes", "i");
+        assert!(result.is_char_boundary(result.len()));
+    }
+    #[test]
+    fn parsed_terms_drive_field_scoring() {
+        let mut i = VaultIndex::new();
+        i.upsert(d("folder/needle.md", "unrelated"));
+        i.upsert(d("other.md", "needle needle"));
+        let results = search(&i, "file:needle").unwrap();
+        assert_eq!(results[0].path, "folder/needle.md");
+    }
+    #[test]
+    fn malformed_or_and_quoted_values() {
+        assert!(parse_query("one OR").is_err());
+        assert!(parse_query("OR one").is_err());
+        assert!(parse_query("-").is_err());
+        assert!(
+            matches!(parse_query("content:\"two words\"").unwrap(), Query::Content(v) if v == "two words")
+        );
+        assert!(
+            matches!(parse_query(r#"content:"two \"words\"""#).unwrap(), Query::Content(v) if v == "two \"words\"")
+        );
     }
     #[test]
     fn query() {
@@ -528,9 +654,11 @@ mod tests {
     #[test]
     fn links_and_outline() {
         let mut i = VaultIndex::new();
-        i.upsert(d("a.md", "# One\n[[b.md]]"));
+        i.upsert(d("a.md", "# One\n[[Target Note|An alias]],"));
         assert_eq!(outline(&i.get("a.md").unwrap().content)[0].text, "One");
         assert_eq!(links(&i, "a.md").len(), 1);
+        assert_eq!(links(&i, "a.md")[0].target, "Target Note");
+        assert_eq!(links(&i, "a.md")[0].alias.as_deref(), Some("An alias"));
     }
     #[test]
     fn bookmark() {
@@ -552,5 +680,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(graph(&i, &f).1.len(), 1);
+    }
+    #[test]
+    fn graph_groups_and_edges_are_consistent() {
+        let mut i = VaultIndex::new();
+        i.upsert(d("one/a.md", "[[one/b.md]]"));
+        i.upsert(d("two/b.md", ""));
+        let mut groups = BTreeSet::new();
+        groups.insert("one".into());
+        let (nodes, edges) = graph(
+            &i,
+            &GraphFilter {
+                groups,
+                ..Default::default()
+            },
+        );
+        assert!(nodes.iter().all(|n| n.group.as_deref() == Some("one")));
+        assert!(edges
+            .iter()
+            .all(|e| nodes.iter().any(|n| n.id == e.from) && nodes.iter().any(|n| n.id == e.to)));
+    }
+    #[test]
+    fn modified_sort_and_noop_revision() {
+        let mut i = VaultIndex::new();
+        let mut old = d("old.md", "");
+        old.modified = 1;
+        let mut new = d("new.md", "");
+        new.modified = 2;
+        i.upsert(old.clone());
+        i.upsert(new);
+        let revision = i.revision();
+        i.upsert(old);
+        assert_eq!(i.revision(), revision);
+        assert_eq!(explore(&i, "", Sort::Modified), vec!["new.md", "old.md"]);
+        assert_eq!(i.remove("missing.md"), revision);
     }
 }
