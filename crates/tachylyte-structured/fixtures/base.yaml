@@ -1,0 +1,12 @@
+properties:
+  score: 0
+  status: "Todo"
+views:
+  - name: "Open"
+    filter: 'status = "Todo"'
+    sort:
+      - property: score
+        direction: desc
+    layout: table
+future-option:
+  retained: true
