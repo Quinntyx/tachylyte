@@ -59,6 +59,13 @@ pub fn safe_path(path: &str) -> Result<String> {
     Ok(out.join("/"))
 }
 
+fn existing_contains_normalized(existing: &BTreeSet<String>, candidate: &str) -> Result<bool> {
+    let candidate = safe_path(candidate)?;
+    existing.iter().try_fold(false, |found, path| {
+        Ok(found || safe_path(path)? == candidate)
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeatureSettings {
     pub enabled: bool,
@@ -259,7 +266,7 @@ pub fn daily_note_plan(
     } else {
         format!("{folder}/{name}")
     };
-    let create = !existing.contains(&path);
+    let create = !existing_contains_normalized(existing, &path)?;
     let content = if create {
         template
             .map(|t| render_template(t, now, &date, &date))
@@ -365,7 +372,7 @@ pub fn unique_note_plan(
     }
     let base = format!("{folder}/{clean}.{ext}");
     safe_path(&base)?;
-    let path = if !existing.contains(&base) {
+    let path = if !existing_contains_normalized(existing, &base)? {
         base
     } else {
         let stamp = now
@@ -373,13 +380,13 @@ pub fn unique_note_plan(
             .to_string()
             .replace(':', "");
         let candidate = format!("{folder}/{clean}-{stamp}.{ext}");
-        if !existing.contains(&candidate) {
+        if !existing_contains_normalized(existing, &candidate)? {
             candidate
         } else {
             let mut n = 2;
             loop {
                 let p = format!("{folder}/{clean}-{stamp}-{n}.{ext}");
-                if !existing.contains(&p) {
+                if !existing_contains_normalized(existing, &p)? {
                     break p;
                 }
                 n += 1
@@ -460,6 +467,9 @@ pub fn split_note(
     left_path: &str,
     right_path: &str,
 ) -> Result<(NotePlan, NotePlan)> {
+    let source_path = safe_path(source_path)?;
+    let left_path = safe_path(left_path)?;
+    let right_path = safe_path(right_path)?;
     if marker.is_empty()
         || left_path == right_path
         || source_path == left_path
@@ -469,9 +479,6 @@ pub fn split_note(
             "split marker and destinations must be distinct".into(),
         ));
     }
-    safe_path(left_path)?;
-    safe_path(right_path)?;
-    safe_path(source_path)?;
     if Sha256Digest::of(content) != expected_source {
         return Err(WorkflowError::RestorePrecondition(
             "split source digest mismatch".into(),
@@ -491,11 +498,11 @@ pub fn split_note(
             source_action: SourceAction::Retain,
             preconditions: vec![
                 PlanPrecondition {
-                    path: source_path.into(),
+                    path: source_path.clone(),
                     condition: Precondition::ContentDigest(expected_source.clone()),
                 },
                 PlanPrecondition {
-                    path: left_path.into(),
+                    path: left_path.clone(),
                     condition: Precondition::MustNotExist,
                 },
             ],
@@ -507,11 +514,11 @@ pub fn split_note(
             source_action: SourceAction::Retain,
             preconditions: vec![
                 PlanPrecondition {
-                    path: source_path.into(),
+                    path: source_path,
                     condition: Precondition::ContentDigest(expected_source),
                 },
                 PlanPrecondition {
-                    path: right_path.into(),
+                    path: right_path,
                     condition: Precondition::MustNotExist,
                 },
             ],
@@ -525,14 +532,17 @@ pub fn split_note(
     ))
 }
 pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Result<NotePlan> {
-    safe_path(destination)?;
+    let destination = safe_path(destination)?;
     if paths.len() != contents.len() || paths.is_empty() {
         return Err(WorkflowError::InvalidInput(
             "paths and contents must match".into(),
         ));
     }
-    for path in paths {
-        safe_path(path)?;
+    let normalized_paths: Vec<String> = paths
+        .iter()
+        .map(|path| safe_path(path))
+        .collect::<Result<_>>()?;
+    for path in &normalized_paths {
         if *path == destination {
             return Err(WorkflowError::InvalidInput(
                 "merge destination equals source".into(),
@@ -540,23 +550,23 @@ pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Resu
         }
     }
     let content = contents.join("\n\n");
-    let rewrites = paths
+    let rewrites = normalized_paths
         .iter()
         .map(|p| LinkRewrite {
-            from: (*p).into(),
-            to: destination.into(),
+            from: p.clone(),
+            to: destination.clone(),
         })
         .collect();
-    let mut preconditions: Vec<PlanPrecondition> = paths
+    let mut preconditions: Vec<PlanPrecondition> = normalized_paths
         .iter()
         .zip(contents.iter())
         .map(|(p, content)| PlanPrecondition {
-            path: (*p).into(),
+            path: p.clone(),
             condition: Precondition::ContentDigest(Sha256Digest::of(content)),
         })
         .collect();
     preconditions.push(PlanPrecondition {
-        path: destination.into(),
+        path: destination.clone(),
         condition: Precondition::MustNotExist,
     });
     Ok(NotePlan {
@@ -579,7 +589,7 @@ pub fn extract_note(
     end: usize,
     destination: &str,
 ) -> Result<NotePlan> {
-    safe_path(destination)?;
+    let destination = safe_path(destination)?;
     if start > end
         || end > content.len()
         || !content.is_char_boundary(start)
@@ -593,11 +603,11 @@ pub fn extract_note(
         content: content[start..end].into(),
         rewrites: vec![LinkRewrite {
             from: "(selection)".into(),
-            to: destination.into(),
+            to: destination.clone(),
         }],
         source_action: SourceAction::Retain,
         preconditions: vec![PlanPrecondition {
-            path: destination.into(),
+            path: destination,
             condition: Precondition::MustNotExist,
         }],
         ordering: vec!["create destination".into()],
@@ -1079,5 +1089,25 @@ mod tests {
         assert!(merge_notes(&["out.md"], &["A"], "out.md").is_err());
         assert_eq!(diff_snapshots("a\nc", "a\nb\nc"), vec!["line 2: +b"]);
         assert!(unique_note_plan("notes", "COM9.txt", "md", &BTreeSet::new(), now()).is_err());
+    }
+    #[test]
+    fn normalized_paths_cannot_bypass_collision_guards() {
+        assert_eq!(safe_path(r"a\b"), safe_path("a/b"));
+        assert_eq!(safe_path("a/./b"), safe_path("a/b"));
+        assert!(merge_notes(&["a\\b.md"], &["A"], "a/b.md").is_err());
+        assert!(merge_notes(&["a/./b.md"], &["A"], "a/b.md").is_err());
+        assert!(split_note(
+            "src\\note.md",
+            "x---y",
+            Sha256Digest::of("x---y"),
+            "---",
+            "src/note.md",
+            "other.md"
+        )
+        .is_err());
+        let mut existing = BTreeSet::new();
+        existing.insert("notes\\new.md".into());
+        let unique = unique_note_plan("notes", "new", "md", &existing, now()).unwrap();
+        assert_ne!(unique.path, "notes/new.md");
     }
 }
