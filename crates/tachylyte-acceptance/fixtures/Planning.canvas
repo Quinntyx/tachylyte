@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    {"id":"brief","type":"text","x":0,"y":0,"width":240,"height":100,"text":"River launch brief","vendorExtension":{"kept":true}},
+    {"id":"home","type":"file","x":300,"y":0,"width":200,"height":80,"file":"Home.md"}
+  ],
+  "edges": [{"id":"e1","fromNode":"brief","toNode":"home","label":"context"}],
+  "vendorCanvasExtension":"preserved"
+}
