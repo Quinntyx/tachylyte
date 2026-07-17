@@ -14,6 +14,19 @@ use std::{
 use url::Url;
 
 pub type ExtraFields = BTreeMap<String, Value>;
+fn secret_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "private_key",
+    ]
+    .iter()
+    .any(|x| k.contains(x))
+}
 
 /// A secret that cannot accidentally appear in logs or formatted errors.
 #[derive(Clone, PartialEq, Eq)]
@@ -55,15 +68,50 @@ pub mod auth {
         Expired,
         Degraded,
     }
-    #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct Session {
         pub state: SessionState,
-        #[serde(skip)]
         pub access_token: Option<Secret>,
-        #[serde(skip)]
         pub refresh_token: Option<Secret>,
-        #[serde(flatten)]
         pub extra: ExtraFields,
+    }
+    impl<'de> Deserialize<'de> for Session {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            #[derive(Deserialize)]
+            struct Wire {
+                state: SessionState,
+                #[serde(flatten)]
+                extra: ExtraFields,
+            }
+            let wire = Wire::deserialize(d)?;
+            if wire.extra.keys().any(|k| super::secret_key(k)) {
+                return Err(serde::de::Error::custom("secret-like session field"));
+            }
+            if matches!(wire.state, SessionState::Authenticated { .. }) {
+                return Err(serde::de::Error::custom(
+                    "authenticated sessions require runtime credentials",
+                ));
+            }
+            Ok(Session {
+                state: wire.state,
+                access_token: None,
+                refresh_token: None,
+                extra: wire.extra,
+            })
+        }
+    }
+    impl serde::Serialize for Session {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let mut out = s.serialize_map(Some(1 + self.extra.len()))?;
+            out.serialize_entry("state", &self.state)?;
+            for (k, v) in &self.extra {
+                if !super::secret_key(k) {
+                    out.serialize_entry(k, v)?;
+                }
+            }
+            out.end()
+        }
     }
     impl fmt::Debug for Session {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -432,24 +480,35 @@ pub mod intents {
     use super::*;
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     pub struct VerificationEvidence {
-        pub algorithm: String,
-        pub key_id: String,
-        pub signature: String,
+        algorithm: String,
+        key_id: String,
+        signature: String,
+    }
+    impl VerificationEvidence {
+        pub fn algorithm(&self) -> &str {
+            &self.algorithm
+        }
+        pub fn key_id(&self) -> &str {
+            &self.key_id
+        }
+        pub fn signature(&self) -> &str {
+            &self.signature
+        }
     }
     pub trait SignatureVerifier {
-        fn verify(&self, metadata: &UpdateMetadata) -> Option<VerificationEvidence>;
+        fn verify(&self, metadata: &UpdateMetadata) -> bool;
     }
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
     pub enum PrintIntent {
         Document { id: String },
         Selection { text: String },
     }
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
     pub enum TransferIntent {
         Import { format: String },
         Export { format: String },
     }
-    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
     pub enum UpdateState {
         Unknown,
         Available {
@@ -468,9 +527,27 @@ pub mod intents {
         pub signature: Option<String>,
         pub signature_algorithm: Option<String>,
         pub key_id: Option<String>,
-        pub evidence: Option<String>,
         #[serde(flatten)]
         pub extra: ExtraFields,
+    }
+    impl UpdateState {
+        pub fn verify<V: SignatureVerifier>(
+            metadata: &UpdateMetadata,
+            verifier: &V,
+        ) -> Option<Self> {
+            if verifier.verify(metadata) {
+                Some(Self::Verified {
+                    version: metadata.version.clone(),
+                    evidence: VerificationEvidence {
+                        algorithm: metadata.signature_algorithm.clone()?,
+                        key_id: metadata.key_id.clone()?,
+                        signature: metadata.signature.clone()?,
+                    },
+                })
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -484,7 +561,12 @@ pub mod uri {
     }
     pub fn parse(raw: &str) -> Option<DeepLink> {
         let parsed = Url::parse(raw).ok()?;
-        if parsed.scheme() != "tachylyte" || parsed.host_str()? != "app" {
+        if parsed.scheme() != "tachylyte"
+            || parsed.host_str()? != "app"
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+        {
             return None;
         }
         let action = parsed.path_segments()?.next()?.to_string();
@@ -499,9 +581,20 @@ pub mod uri {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
+        let target = parsed.fragment().and_then(|raw| {
+            url::form_urlencoded::parse(format!("x={raw}").as_bytes())
+                .next()
+                .map(|(_, v)| v.into_owned())
+        });
+        if target
+            .as_deref()
+            .is_some_and(|t| t.is_empty() || t.chars().any(char::is_control))
+        {
+            return None;
+        }
         Some(DeepLink {
             action,
-            target: parsed.fragment().map(str::to_owned),
+            target,
             params,
         })
     }
@@ -549,24 +642,27 @@ pub struct PlatformCapabilities {
 /// A deterministic transport useful in unit tests; it never performs I/O.
 #[derive(Default)]
 pub struct MockTransport {
-    pub responses: BTreeMap<String, Vec<u8>>,
-    pub requests: Vec<String>,
+    responses: BTreeMap<String, Vec<u8>>,
+    requests: Vec<String>,
 }
 impl MockTransport {
     pub fn respond(&mut self, key: impl Into<String>, body: Vec<u8>) {
-        self.responses.insert(key.into(), body);
+        let key = key.into();
+        if secret_key(&key) {
+            return;
+        }
+        self.responses.insert(key, body);
     }
     pub fn request(&mut self, key: &str) -> Option<Vec<u8>> {
-        let safe_key = if key.contains("token=") || key.contains("secret=") {
-            "[REDACTED]"
-        } else {
-            key
-        };
+        let safe_key = if secret_key(key) { "[REDACTED]" } else { key };
         self.requests.push(safe_key.into());
         self.responses.get(key).cloned()
     }
     pub fn request_with_secret(&mut self, key: &str, _secret: &Secret) -> Option<Vec<u8>> {
         self.request(key)
+    }
+    pub fn recorded_requests(&self) -> &[String] {
+        &self.requests
     }
 }
 
@@ -625,7 +721,7 @@ mod tests {
         let mut t = MockTransport::default();
         t.respond("x", vec![1]);
         assert_eq!(t.request("x"), Some(vec![1]));
-        assert_eq!(t.requests, ["x"]);
+        assert_eq!(t.recorded_requests(), ["x"]);
     }
     #[test]
     fn secrets_are_not_serialized_or_recorded() {
@@ -639,9 +735,19 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("raw"));
+        assert!(serde_json::from_str::<auth::Session>(
+            r#"{"state":{"Authenticated":{"account_id":"a"}}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<auth::Session>(
+            r#"{"state":"SignedOut","access_token":"raw"}"#
+        )
+        .is_err());
         let mut t = MockTransport::default();
         t.request_with_secret("token=raw", s.access_token.as_ref().unwrap());
-        assert_eq!(t.requests, ["[REDACTED]"]);
+        assert_eq!(t.recorded_requests(), ["[REDACTED]"]);
+        t.respond("PASSWORD=raw", vec![2]);
+        assert!(t.request("password=raw").is_none());
     }
     #[test]
     fn auth_clears_and_validates() {
@@ -714,5 +820,7 @@ mod tests {
             "a b"
         );
         assert!(uri::parse("tachylyte://app/bad%20x").is_none());
+        assert!(uri::parse("tachylyte://user:pw@app/open").is_none());
+        assert!(uri::parse("tachylyte://app:443/open").is_none());
     }
 }
