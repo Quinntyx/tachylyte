@@ -5462,6 +5462,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-settings-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
 name = "tachylyte-structured"
 version = "0.1.0"
 dependencies = [
