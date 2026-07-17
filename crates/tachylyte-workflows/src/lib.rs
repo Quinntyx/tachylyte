@@ -6,8 +6,8 @@
 
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, WorkflowError>;
@@ -26,6 +26,14 @@ pub enum WorkflowError {
     LossyConversion(String),
     #[error("restore precondition failed: {0}")]
     RestorePrecondition(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Sha256Digest(pub [u8; 32]);
+impl Sha256Digest {
+    pub fn of(content: &str) -> Self {
+        Self(Sha256::digest(content.as_bytes()).into())
+    }
 }
 
 /// Validate and normalize a vault-relative path. No absolute paths or `..` are
@@ -125,6 +133,98 @@ impl WorkflowService {
     ) -> Result<AudioSession> {
         self.registry.require("audio-recorder")?;
         audio_start(id, folder, now)
+    }
+    pub fn unique_note(
+        &self,
+        folder: &str,
+        title: &str,
+        extension: &str,
+        existing: &BTreeSet<String>,
+        now: DateTime<FixedOffset>,
+    ) -> Result<UniqueNotePlan> {
+        self.registry.require("unique-note")?;
+        unique_note_plan(folder, title, extension, existing, now)
+    }
+    pub fn split_note(
+        &self,
+        source: &str,
+        content: &str,
+        digest: Sha256Digest,
+        marker: &str,
+        left: &str,
+        right: &str,
+    ) -> Result<(NotePlan, NotePlan)> {
+        self.registry.require("note-composer")?;
+        split_note(source, content, digest, marker, left, right)
+    }
+    pub fn merge_notes(
+        &self,
+        paths: &[&str],
+        contents: &[&str],
+        destination: &str,
+    ) -> Result<NotePlan> {
+        self.registry.require("note-composer")?;
+        merge_notes(paths, contents, destination)
+    }
+    pub fn extract_note(
+        &self,
+        content: &str,
+        start: usize,
+        end: usize,
+        destination: &str,
+    ) -> Result<NotePlan> {
+        self.registry.require("note-composer")?;
+        extract_note(content, start, end, destination)
+    }
+    pub fn convert_format(&self, input: &str, from: &str, to: &str) -> Result<ConversionPlan> {
+        self.registry.require("format-converter")?;
+        convert_format(input, from, to)
+    }
+    pub fn recovery_retention(
+        &self,
+        snapshots: Vec<Snapshot>,
+        keep: usize,
+    ) -> Result<RecoveryPlan> {
+        self.registry.require("file-recovery")?;
+        Ok(retention_plan(snapshots, keep))
+    }
+    pub fn restore_checked(
+        &self,
+        snapshot: &Snapshot,
+        current: &str,
+        revision: u64,
+        digest: Sha256Digest,
+    ) -> Result<RestorePlan> {
+        self.registry.require("file-recovery")?;
+        restore_plan_checked(snapshot, current, revision, digest)
+    }
+    pub fn slides(&self, markdown: &str) -> Result<Vec<Slide>> {
+        self.registry.require("slides")?;
+        Ok(parse_slides(markdown))
+    }
+    pub fn word_status(&self, text: &str) -> Result<WordStatus> {
+        self.registry.require("word-count")?;
+        Ok(word_status(text))
+    }
+    pub fn commands(&self, definitions: &[CommandDefinition]) -> Result<Vec<CommandDefinition>> {
+        self.registry.require("commands")?;
+        Ok(command_definitions(&self.registry, definitions))
+    }
+    pub fn slash_commands<'a>(
+        &self,
+        query: &str,
+        commands: &'a [CommandDefinition],
+    ) -> Result<Vec<&'a CommandDefinition>> {
+        self.registry.require("commands")?;
+        Ok(rank_slash_commands(query, commands))
+    }
+    pub fn audio_transition(
+        &self,
+        session: &AudioSession,
+        state: AudioState,
+    ) -> Result<AudioSession> {
+        self.registry.require("audio-recorder")?;
+        audio_transition(session, state)
     }
 }
 
@@ -229,6 +329,7 @@ pub fn render_template(
 pub struct UniqueNotePlan {
     pub path: String,
     pub title: String,
+    pub precondition: PlanPrecondition,
 }
 pub fn unique_note_plan(
     folder: &str,
@@ -285,14 +386,23 @@ pub fn unique_note_plan(
             }
         }
     };
-    Ok(UniqueNotePlan { path, title: clean })
+    Ok(UniqueNotePlan {
+        path: path.clone(),
+        title: clean,
+        precondition: PlanPrecondition {
+            path,
+            condition: Precondition::MustNotExist,
+        },
+    })
 }
 
 fn is_reserved_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "LPT1"
-    )
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,9 +416,14 @@ pub enum SourceAction {
     Delete,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Precondition {
+    MustNotExist,
+    ContentDigest(Sha256Digest),
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanPrecondition {
     pub path: String,
-    pub expected_content: Option<String>,
+    pub condition: Precondition,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NotePlan {
@@ -316,6 +431,7 @@ pub struct NotePlan {
     pub rewrites: Vec<LinkRewrite>,
     pub source_action: SourceAction,
     pub preconditions: Vec<PlanPrecondition>,
+    pub ordering: Vec<String>,
 }
 pub fn compose_note(
     title: &str,
@@ -333,21 +449,34 @@ pub fn compose_note(
         rewrites: Vec::new(),
         source_action: SourceAction::Retain,
         preconditions: Vec::new(),
+        ordering: Vec::new(),
     })
 }
 pub fn split_note(
+    source_path: &str,
     content: &str,
+    expected_source: Sha256Digest,
     marker: &str,
     left_path: &str,
     right_path: &str,
 ) -> Result<(NotePlan, NotePlan)> {
-    if marker.is_empty() || left_path == right_path {
+    if marker.is_empty()
+        || left_path == right_path
+        || source_path == left_path
+        || source_path == right_path
+    {
         return Err(WorkflowError::InvalidInput(
             "split marker and destinations must be distinct".into(),
         ));
     }
     safe_path(left_path)?;
     safe_path(right_path)?;
+    safe_path(source_path)?;
+    if Sha256Digest::of(content) != expected_source {
+        return Err(WorkflowError::RestorePrecondition(
+            "split source digest mismatch".into(),
+        ));
+    }
     let mut parts = content.splitn(2, marker);
     let left = parts.next().unwrap_or("");
     let right = parts
@@ -360,19 +489,38 @@ pub fn split_note(
             // must never be applied to either newly-created body.
             rewrites: Vec::new(),
             source_action: SourceAction::Retain,
-            preconditions: vec![PlanPrecondition {
-                path: left_path.into(),
-                expected_content: Some(content.to_string()),
-            }],
+            preconditions: vec![
+                PlanPrecondition {
+                    path: source_path.into(),
+                    condition: Precondition::ContentDigest(expected_source.clone()),
+                },
+                PlanPrecondition {
+                    path: left_path.into(),
+                    condition: Precondition::MustNotExist,
+                },
+            ],
+            ordering: vec!["check source".into(), "create left".into()],
         },
         NotePlan {
             content: right.into(),
             rewrites: Vec::new(),
             source_action: SourceAction::Retain,
-            preconditions: vec![PlanPrecondition {
-                path: left_path.into(),
-                expected_content: Some(content.to_string()),
-            }],
+            preconditions: vec![
+                PlanPrecondition {
+                    path: source_path.into(),
+                    condition: Precondition::ContentDigest(expected_source),
+                },
+                PlanPrecondition {
+                    path: right_path.into(),
+                    condition: Precondition::MustNotExist,
+                },
+            ],
+            ordering: vec![
+                "check source".into(),
+                "create left".into(),
+                "create right".into(),
+                "rewrite external links".into(),
+            ],
         },
     ))
 }
@@ -385,6 +533,11 @@ pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Resu
     }
     for path in paths {
         safe_path(path)?;
+        if *path == destination {
+            return Err(WorkflowError::InvalidInput(
+                "merge destination equals source".into(),
+            ));
+        }
     }
     let content = contents.join("\n\n");
     let rewrites = paths
@@ -394,18 +547,30 @@ pub fn merge_notes(paths: &[&str], contents: &[&str], destination: &str) -> Resu
             to: destination.into(),
         })
         .collect();
-    let preconditions = paths
+    let mut preconditions: Vec<PlanPrecondition> = paths
         .iter()
-        .map(|p| PlanPrecondition {
+        .zip(contents.iter())
+        .map(|(p, content)| PlanPrecondition {
             path: (*p).into(),
-            expected_content: None,
+            condition: Precondition::ContentDigest(Sha256Digest::of(content)),
         })
         .collect();
+    preconditions.push(PlanPrecondition {
+        path: destination.into(),
+        condition: Precondition::MustNotExist,
+    });
     Ok(NotePlan {
         content,
         rewrites,
         source_action: SourceAction::Delete,
         preconditions,
+        ordering: vec![
+            "check all source digests".into(),
+            "check destination absent".into(),
+            "create destination".into(),
+            "rewrite links".into(),
+            "delete sources".into(),
+        ],
     })
 }
 pub fn extract_note(
@@ -431,7 +596,11 @@ pub fn extract_note(
             to: destination.into(),
         }],
         source_action: SourceAction::Retain,
-        preconditions: Vec::new(),
+        preconditions: vec![PlanPrecondition {
+            path: destination.into(),
+            condition: Precondition::MustNotExist,
+        }],
+        ordering: vec!["create destination".into()],
     })
 }
 
@@ -593,20 +762,20 @@ pub fn restore_plan(snapshot: &Snapshot, current: &str) -> Result<ConversionPlan
 pub struct RestorePlan {
     pub output: String,
     pub revision: u64,
-    pub expected_current_checksum: u64,
+    pub expected_current_checksum: Sha256Digest,
 }
 pub fn restore_plan_checked(
     snapshot: &Snapshot,
     current: &str,
     expected_revision: u64,
-    expected_checksum: u64,
+    expected_checksum: Sha256Digest,
 ) -> Result<RestorePlan> {
     if snapshot.revision != expected_revision {
         return Err(WorkflowError::RestorePrecondition(
             "revision identity mismatch".into(),
         ));
     }
-    let actual = checksum(current);
+    let actual = Sha256Digest::of(current);
     if actual != expected_checksum {
         return Err(WorkflowError::RestorePrecondition(
             "current content checksum mismatch".into(),
@@ -618,22 +787,34 @@ pub fn restore_plan_checked(
         expected_current_checksum: expected_checksum,
     })
 }
-fn checksum(content: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut h);
-    h.finish()
-}
 pub fn diff_snapshots(old: &str, new: &str) -> Vec<String> {
     let old_lines: Vec<_> = old.lines().collect();
     let new_lines: Vec<_> = new.lines().collect();
-    (0..old_lines.len().max(new_lines.len()))
-        .filter_map(|i| match (old_lines.get(i), new_lines.get(i)) {
-            (Some(a), Some(b)) if a != b => Some(format!("line {}: -{} +{}", i + 1, a, b)),
-            (Some(a), None) => Some(format!("line {}: -{}", i + 1, a)),
-            (None, Some(b)) => Some(format!("line {}: +{}", i + 1, b)),
-            _ => None,
-        })
-        .collect()
+    let mut lcs = vec![vec![0usize; new_lines.len() + 1]; old_lines.len() + 1];
+    for i in (0..old_lines.len()).rev() {
+        for j in (0..new_lines.len()).rev() {
+            lcs[i][j] = if old_lines[i] == new_lines[j] {
+                1 + lcs[i + 1][j + 1]
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut result = Vec::new();
+    while i < old_lines.len() || j < new_lines.len() {
+        if i < old_lines.len() && j < new_lines.len() && old_lines[i] == new_lines[j] {
+            i += 1;
+            j += 1;
+        } else if j < new_lines.len() && (i == old_lines.len() || lcs[i][j + 1] >= lcs[i + 1][j]) {
+            result.push(format!("line {}: +{}", i + 1, new_lines[j]));
+            j += 1;
+        } else {
+            result.push(format!("line {}: -{}", i + 1, old_lines[i]));
+            i += 1;
+        }
+    }
+    result
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -790,10 +971,17 @@ mod tests {
     #[test]
     fn split_recovery_slides_and_status() {
         assert_eq!(
-            split_note("a\n---\nb", "\n---\n", "a.md", "b.md")
-                .unwrap()
-                .0
-                .content,
+            split_note(
+                "source.md",
+                "a\n---\nb",
+                Sha256Digest::of("a\n---\nb"),
+                "\n---\n",
+                "a.md",
+                "b.md"
+            )
+            .unwrap()
+            .0
+            .content,
             "a"
         );
         let s = Snapshot {
@@ -807,12 +995,20 @@ mod tests {
     }
     #[test]
     fn plans_are_explicit_and_split_does_not_rewrite_new_bodies() {
-        let (left, right) = split_note("a\n---\nb", "\n---\n", "source.md", "right.md").unwrap();
+        let (left, right) = split_note(
+            "source.md",
+            "a\n---\nb",
+            Sha256Digest::of("a\n---\nb"),
+            "\n---\n",
+            "a.md",
+            "right.md",
+        )
+        .unwrap();
         assert!(left.rewrites.is_empty() && right.rewrites.is_empty());
         assert_eq!(left.source_action, SourceAction::Retain);
         assert_eq!(
-            left.preconditions[0].expected_content.as_deref(),
-            Some("a\n---\nb")
+            left.preconditions[0].condition,
+            Precondition::ContentDigest(Sha256Digest::of("a\n---\nb"))
         );
         assert!(
             merge_notes(&["a.md"], &["a"], "merged.md")
@@ -840,10 +1036,10 @@ mod tests {
             timestamp: now(),
             content: "old".into(),
         };
-        assert!(restore_plan_checked(&s, "current", 2, checksum("current")).is_err());
-        assert!(restore_plan_checked(&s, "current", 3, checksum("wrong")).is_err());
+        assert!(restore_plan_checked(&s, "current", 2, Sha256Digest::of("current")).is_err());
+        assert!(restore_plan_checked(&s, "current", 3, Sha256Digest::of("wrong")).is_err());
         assert_eq!(
-            restore_plan_checked(&s, "current", 3, checksum("current"))
+            restore_plan_checked(&s, "current", 3, Sha256Digest::of("current"))
                 .unwrap()
                 .revision,
             3
@@ -866,5 +1062,22 @@ mod tests {
         registry.set_enabled("note-composer", false);
         let service = WorkflowService::new(registry);
         assert!(service.compose_note("x", None, "body", now()).is_err());
+    }
+    #[test]
+    fn destination_guards_digests_and_lcs_are_explicit() {
+        let unique = unique_note_plan("notes", "new", "md", &BTreeSet::new(), now()).unwrap();
+        assert_eq!(unique.precondition.condition, Precondition::MustNotExist);
+        let merged = merge_notes(&["a.md", "b.md"], &["A", "B"], "out.md").unwrap();
+        assert!(merged
+            .preconditions
+            .iter()
+            .any(|p| p.path == "out.md" && p.condition == Precondition::MustNotExist));
+        assert!(merged
+            .preconditions
+            .iter()
+            .any(|p| p.condition == Precondition::ContentDigest(Sha256Digest::of("A"))));
+        assert!(merge_notes(&["out.md"], &["A"], "out.md").is_err());
+        assert_eq!(diff_snapshots("a\nc", "a\nb\nc"), vec!["line 2: +b"]);
+        assert!(unique_note_plan("notes", "COM9.txt", "md", &BTreeSet::new(), now()).is_err());
     }
 }
