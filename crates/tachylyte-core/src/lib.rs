@@ -6,7 +6,7 @@
 #[cfg(target_os = "linux")]
 use rustix::fs::{
     fsync, mkdirat, openat, openat2, renameat, renameat_with, unlinkat, AtFlags, Mode, OFlags,
-    RenameFlags, ResolveFlags,
+    RenameFlags, ResolveFlags, CWD,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -95,13 +95,30 @@ pub struct Vault {
     root_cap: Arc<fs::File>,
 }
 impl Vault {
-    /// Open (or create) a vault directory.
+    /// Open an existing vault directory.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, CoreError> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root).map_err(|e| io_at(&root, e))?;
-        let root = fs::canonicalize(&root).map_err(|e| io_at(&root, e))?;
         #[cfg(target_os = "linux")]
-        let root_cap = Arc::new(fs::File::open(&root).map_err(|e| io_at(&root, e))?);
+        let root_cap = Arc::new(fs::File::from(
+            openat(
+                CWD,
+                &root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| io_at(&root, io::Error::from_raw_os_error(e.raw_os_error())))?,
+        ));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let metadata = fs::symlink_metadata(&root).map_err(|e| io_at(&root, e))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CoreError::InvalidPath(format!(
+                    "vault root is not a directory: {}",
+                    root.display()
+                )));
+            }
+        }
+        let root = fs::canonicalize(&root).map_err(|e| io_at(&root, e))?;
         Ok(Self {
             root,
             #[cfg(target_os = "linux")]
@@ -958,5 +975,24 @@ mod tests {
         let p = VaultPath::new("inside.md").unwrap();
         v.create(&p, b"x").unwrap();
         assert!(matches!(v.trash(&p), Err(CoreError::Symlink(_))));
+    }
+
+    #[test]
+    fn open_requires_existing_directory() {
+        let d = tempdir().unwrap();
+        let missing = d.path().join("missing-vault");
+        assert!(Vault::open(&missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+        let d = tempdir().unwrap();
+        let actual = d.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        let link = d.path().join("link");
+        symlink(&actual, &link).unwrap();
+        assert!(Vault::open(&link).is_err());
     }
 }
