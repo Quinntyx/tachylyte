@@ -22,3 +22,5 @@ tachylyte-workflows = { path = "crates/tachylyte-workflows" }
 tachylyte-workflow-ui = { path = "crates/tachylyte-workflow-ui" }
 tachylyte-media-ui = { path = "crates/tachylyte-media-ui" }
 tachylyte-settings-ui = { path = "crates/tachylyte-settings-ui" }
+tachylyte-graph-ui = { path = "crates/tachylyte-graph-ui" }
+tachylyte-editor-ui = { path = "crates/tachylyte-editor-ui" }

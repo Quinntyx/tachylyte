@@ -15,6 +15,14 @@ use tachylyte_markdown::{EditorDocument, Span, ViewMode};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+pub mod editor_intents;
+pub mod editor_options;
+pub mod render_surface;
+pub mod search_bar;
+
+use editor_intents::EditorIntent;
+use editor_options::{EditorOptions, EditorOptionsEvent, LineWrap, MenuAction, ToolbarAction};
+
 /// A UTF-8 byte cursor. All offsets are normalized to character boundaries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Cursor(pub usize);
@@ -72,6 +80,8 @@ pub enum EditorEvent {
     SaveRequested,
     ModeChanged(ViewMode),
     FindChanged,
+    Intent(EditorIntent),
+    Options(EditorOptionsEvent),
 }
 
 /// The complete editing model. It is safe to use without a window or filesystem.
@@ -87,6 +97,7 @@ pub struct EditorState {
     history: Vec<(String, Selection)>,
     redo_history: Vec<(String, Selection)>,
     marked: Option<Range<usize>>,
+    find_active: Option<usize>,
     revision: u64,
 }
 impl EditorState {
@@ -103,6 +114,7 @@ impl EditorState {
             history: Vec::new(),
             redo_history: Vec::new(),
             marked: None,
+            find_active: None,
             revision: 0,
         }
     }
@@ -266,6 +278,7 @@ impl EditorState {
     }
     pub fn set_find_query(&mut self, query: impl Into<String>) {
         self.find_query = query.into();
+        self.find_active = None;
         self.events.push(EditorEvent::FindChanged);
     }
     pub fn find_query(&self) -> &str {
@@ -288,6 +301,55 @@ impl EditorState {
             }
         }
         out
+    }
+
+    /// Selects the next or previous find result without changing source text.
+    pub fn move_find(&mut self, backwards: bool) -> Option<FindResult> {
+        let results = self.find_results();
+        if results.is_empty() {
+            self.find_active = None;
+            return None;
+        }
+        self.find_active = Some(match (self.find_active, backwards) {
+            (None, true) => results.len() - 1,
+            (None, false) => 0,
+            (Some(i), true) => i.checked_sub(1).unwrap_or(results.len() - 1),
+            (Some(i), false) => (i + 1) % results.len(),
+        });
+        results.get(self.find_active.unwrap()).copied()
+    }
+
+    pub fn find_active_index(&self) -> Option<usize> {
+        self.find_active
+    }
+
+    pub fn replace_current_find(&mut self, replacement: &str) -> bool {
+        let Some(index) = self.find_active else {
+            return false;
+        };
+        let Some(result) = self.find_results().get(index).copied() else {
+            return false;
+        };
+        self.replace(result.span.start..result.span.end, replacement);
+        true
+    }
+
+    pub fn replace_all_find(&mut self, replacement: &str) -> usize {
+        let results = self.find_results();
+        let count = results.len();
+        for result in results.into_iter().rev() {
+            self.replace(result.span.start..result.span.end, replacement);
+        }
+        self.find_active = None;
+        count
+    }
+
+    /// Emits an intent for the construct at a source offset. The source remains
+    /// untouched; applications decide whether and how to execute the action.
+    pub fn activate_intent_at(&mut self, offset: usize) -> Option<EditorIntent> {
+        let intent = EditorIntent::at(self.source(), offset)?;
+        self.events.push(EditorEvent::Intent(intent.clone()));
+        Some(intent)
     }
     pub fn replace_marked_text(
         &mut self,
@@ -473,26 +535,45 @@ fn inline_element(inline: &tachylyte_markdown::Inline) -> AnyElement {
             .underline()
             .child(label.clone())
             .into_any_element(),
-        Inline::WikiLink { target, alias, .. } => div()
+        Inline::WikiLink {
+            target,
+            alias,
+            block,
+            ..
+        } => div()
             .text_color(rgb(ACCENT))
             .underline()
-            .child(alias.clone().unwrap_or_else(|| target.clone()))
+            .child(match (alias, block) {
+                (Some(alias), Some(block)) => format!("{} ↗ #^{}", alias, block),
+                (Some(alias), None) => alias.clone(),
+                (None, Some(block)) => format!("{} ↗ #^{}", target, block),
+                (None, None) => target.clone(),
+            })
             .into_any_element(),
         Inline::Tag { value, .. } => div()
             .text_color(rgb(ACCENT))
             .child(value.clone())
             .into_any_element(),
         Inline::Math { value, .. } => div()
+            .bg(rgb(PANEL))
             .text_color(rgb(ACCENT))
-            .child(value.clone())
+            .child(format!("∑ {} [math placeholder]", value))
             .into_any_element(),
         Inline::FootnoteRef { label, .. } => div()
             .text_color(rgb(ACCENT))
             .child(format!("[{}]", label))
             .into_any_element(),
         Inline::Embed { target, alias, .. } => div()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .rounded(px(4.0))
+            .px(px(5.0))
             .text_color(rgb(MUTED))
-            .child(alias.clone().unwrap_or_else(|| target.clone()))
+            .child(format!(
+                "▧ {} [embed placeholder]",
+                alias.clone().unwrap_or_else(|| target.clone())
+            ))
             .into_any_element(),
     }
 }
@@ -531,11 +612,20 @@ fn block_element(block: &tachylyte_markdown::Block) -> AnyElement {
             .p(px(12.0))
             .mb(px(12.0))
             .text_color(rgb(INK))
-            .child(format!(
-                "{}\n{}",
-                language.as_deref().unwrap_or("code"),
-                value
-            ))
+            .child(
+                if matches!(
+                    language.as_deref(),
+                    Some("mermaid") | Some("diagram") | Some("plantuml")
+                ) {
+                    format!(
+                        "◇ {} diagram placeholder\n{}",
+                        language.as_deref().unwrap_or("diagram"),
+                        value
+                    )
+                } else {
+                    format!("{}\n{}", language.as_deref().unwrap_or("code"), value)
+                },
+            )
             .into_any_element(),
         Block::Quote { children, .. } => div()
             .border_l_2()
@@ -613,6 +703,8 @@ fn block_element(block: &tachylyte_markdown::Block) -> AnyElement {
 /// A GPUI view over [`EditorState`]. Use `cx.new(|cx| MarkdownEditor::new(...))`.
 pub struct MarkdownEditor {
     pub state: EditorState,
+    /// Presentation-only controls; these never alter the Markdown source.
+    pub options: EditorOptions,
     focus: FocusHandle,
     scroll: gpui::ScrollHandle,
     pub accessibility_label: String,
@@ -714,6 +806,7 @@ impl MarkdownEditor {
     pub fn from_state(state: EditorState, cx: &mut Context<Self>) -> Self {
         Self {
             state,
+            options: EditorOptions::default(),
             focus: cx.focus_handle(),
             scroll: Default::default(),
             accessibility_label: "Markdown editor".into(),
@@ -754,6 +847,18 @@ impl MarkdownEditor {
     pub fn take_events(&mut self) -> Vec<EditorEvent> {
         self.state.take_events()
     }
+
+    pub fn take_option_events(&mut self) -> Vec<EditorOptionsEvent> {
+        self.options.take_events()
+    }
+
+    pub fn toolbar_action(&mut self, action: ToolbarAction) {
+        self.options.toolbar(action);
+    }
+
+    pub fn menu_action(&mut self, action: MenuAction) {
+        self.options.menu(action);
+    }
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
@@ -776,7 +881,10 @@ impl Render for MarkdownEditor {
         let selection = self.state.selection();
         let cursor = self.state.cursor().0;
         let mode = self.state.mode();
+        let line_wrap = self.options.line_wrap() == LineWrap::Wrap;
+        let show_line_numbers = self.options.show_line_numbers();
         let source_lines = self.state.projection().into_iter().map(move |line| {
+            let line_number = line.number;
             let mut children = Vec::new();
             let selected = selection.range();
             let line_end = line.span.end;
@@ -825,21 +933,71 @@ impl Render for MarkdownEditor {
             }
             div()
                 .flex()
+                .when(line_wrap, |line| line.max_w(px(760.0)))
                 .text_size(px(15.0))
-                .child(
-                    div()
-                        .w(px(42.0))
-                        .text_color(rgb(MUTED))
-                        .child(format!("{:>3}", line.number)),
-                )
+                .when(show_line_numbers, |line| {
+                    line.child(
+                        div()
+                            .w(px(42.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{:>3}", line_number)),
+                    )
+                })
                 .children(children)
                 .into_any_element()
         });
         // Build the reading projection from the source that is current for this
         // render.  Keeping an owned document here also prevents a deferred GPUI
         // child iterator from retaining a projection from an earlier frame.
-        let reading_document = (mode == ViewMode::Reading)
+        let reading_document = (mode != ViewMode::Source)
             .then(|| restore_document(self.state.source().to_owned(), self.state.revision()));
+        let reading_children = reading_document.as_ref().map(|document| {
+            let mut children = Vec::new();
+            if let Some(frontmatter) = &document.document().frontmatter {
+                children.push(
+                    div()
+                        .w_full()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .rounded(px(6.0))
+                        .p(px(10.0))
+                        .mb(px(14.0))
+                        .child(div().text_color(rgb(MUTED)).child("Properties"))
+                        .children(frontmatter.properties.iter().map(|property| {
+                            div()
+                                .flex()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("{}: ", property.key)),
+                                )
+                                .child(property.value.clone())
+                                .into_any_element()
+                        }))
+                        .into_any_element(),
+                );
+            }
+            children.extend(document.document().blocks.iter().map(block_element));
+            if !document.document().footnotes.is_empty() {
+                children.push(
+                    div()
+                        .mt(px(18.0))
+                        .border_t_1()
+                        .border_color(rgb(BORDER))
+                        .pt(px(10.0))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Footnotes"))
+                        .children(document.document().footnotes.iter().map(|footnote| {
+                            div()
+                                .text_color(rgb(MUTED))
+                                .child(format!("[{}] {}", footnote.label, footnote.definition))
+                                .into_any_element()
+                        }))
+                        .into_any_element(),
+                );
+            }
+            children
+        });
         let toolbar_entity = entity.clone();
         let toolbar_focus = focus.clone();
         let toolbar = div()
@@ -876,21 +1034,111 @@ impl Render for MarkdownEditor {
                             .into_any_element()
                     }),
             );
-        let content = if mode == ViewMode::Reading {
+        let option_entity = entity.clone();
+        let option_focus = focus.clone();
+        let option_button = move |label: String, action: ToolbarAction| {
+            let option_entity = option_entity.clone();
+            let option_focus = option_focus.clone();
             div()
+                .id(ElementId::Name(format!("option-{label}").into()))
+                .cursor_pointer()
+                .px(px(7.0))
+                .py(px(5.0))
+                .rounded(px(4.0))
+                .text_color(rgb(MUTED))
+                .child(label)
+                .on_click(move |_, window, cx| {
+                    option_focus.focus(window);
+                    option_entity.update(cx, |editor, _| editor.options.toolbar(action));
+                })
+                .into_any_element()
+        };
+        let find_entity = entity.clone();
+        let find_focus = focus.clone();
+        let find_bar = div()
+            .flex()
+            .items_center()
+            .gap(px(3.0))
+            .ml(px(8.0))
+            .text_color(rgb(MUTED))
+            .child(format!(
+                "Find: {} ({})",
+                if self.state.find_query().is_empty() {
+                    "—"
+                } else {
+                    self.state.find_query()
+                },
+                self.state.find_results().len()
+            ))
+            .child(
+                div()
+                    .id("find-previous")
+                    .cursor_pointer()
+                    .child("‹")
+                    .on_click({
+                        let find_entity = find_entity.clone();
+                        let find_focus = find_focus.clone();
+                        move |_, window, cx| {
+                            find_focus.focus(window);
+                            find_entity.update(cx, |editor, _| {
+                                editor.state.move_find(true);
+                            });
+                        }
+                    }),
+            )
+            .child(div().id("find-next").cursor_pointer().child("›").on_click({
+                let find_entity = find_entity.clone();
+                let find_focus = find_focus.clone();
+                move |_, window, cx| {
+                    find_focus.focus(window);
+                    find_entity.update(cx, |editor, _| {
+                        editor.state.move_find(false);
+                    });
+                }
+            }))
+            .child("Replace: use source-safe API");
+        let option_controls = div()
+            .flex()
+            .items_center()
+            .children([
+                option_button(
+                    format!("Wrap: {:?}", self.options.line_wrap()),
+                    ToolbarAction::ToggleLineWrap,
+                ),
+                option_button(
+                    format!(
+                        "Gutter: {}",
+                        if self.options.show_line_numbers() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ),
+                    ToolbarAction::ToggleLineNumbers,
+                ),
+                option_button("Spellcheck: unavailable".into(), ToolbarAction::Spellcheck),
+                option_button("Vim: unavailable".into(), ToolbarAction::VimMode),
+            ])
+            .child(find_bar);
+        let toolbar = toolbar.child(option_controls);
+        let reading_entity = entity.clone();
+        let content = if mode != ViewMode::Source {
+            div()
+                .id("reading-content")
                 .w_full()
                 .max_w(px(820.0))
                 .mx_auto()
                 .p(px(32.0))
-                .children(
-                    reading_document
-                        .as_ref()
-                        .expect("reading document is built for reading mode")
-                        .document()
-                        .blocks
-                        .iter()
-                        .map(block_element),
-                )
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    // Reading-mode surfaces are intentionally non-editing. A click
+                    // asks the model for an intent at the current source cursor;
+                    // the host application can then open links or toggle tasks.
+                    reading_entity.update(cx, |editor, _| {
+                        editor.state.activate_intent_at(cursor);
+                    });
+                })
+                .children(reading_children.expect("reading children are built for reading mode"))
                 .into_any_element()
         } else {
             div().p(px(14.0)).children(source_lines).into_any_element()
@@ -1157,6 +1405,22 @@ mod tests {
         assert_eq!(e.find_results().len(), 2);
         assert_eq!(e.projection().len(), 2);
         assert_eq!(e.mode(), ViewMode::Reading);
+    }
+
+    #[test]
+    fn find_navigation_and_intents_are_non_destructive() {
+        let mut e = EditorState::new("[[Page]] and #tag");
+        e.set_find_query("Page");
+        assert_eq!(
+            e.move_find(false).map(|result| result.span),
+            Some(Span::new(2, 6))
+        );
+        assert_eq!(e.source(), "[[Page]] and #tag");
+        assert!(e.activate_intent_at(3).is_some());
+        assert!(e
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, EditorEvent::Intent(_))));
     }
     #[test]
     fn astral_utf16_ranges_are_character_safe() {

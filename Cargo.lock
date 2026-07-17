@@ -5394,9 +5394,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tachylyte-core",
+ "tachylyte-editor-ui",
+ "tachylyte-graph-ui",
  "tachylyte-knowledge",
  "tachylyte-markdown",
+ "tachylyte-settings-ui",
  "tachylyte-theme",
+ "tachylyte-workflow-ui",
  "tempfile",
 ]
 
@@ -5436,6 +5440,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tachylyte-launcher-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tachylyte-vaults",
 ]
 
 [[package]]
