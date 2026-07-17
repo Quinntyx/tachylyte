@@ -344,6 +344,7 @@ impl Workspace {
             Action::Open { window, view } => {
                 if !self.view_kinds.is_empty() && !self.view_kinds.contains(&view.kind) {
                     effects.push(Effect::UnknownView(view.kind.clone()));
+                    return effects;
                 }
                 if self.features.get(&view.kind).copied() == Some(false) {
                     effects.push(Effect::Error(format!("feature disabled: {}", view.kind)));
@@ -376,7 +377,11 @@ impl Workspace {
                 self.remove_tab(&tab);
             }
             Action::Split { tab, orientation } => {
-                self.split_tab(&tab, orientation);
+                if tab.is_empty() || !self.split_tab(&tab, orientation) {
+                    effects.push(Effect::Error(
+                        "split requires an existing tab and a non-empty sibling".into(),
+                    ));
+                }
             }
             Action::Move { tab, target_group } => {
                 self.move_tab(&tab, &target_group);
@@ -390,8 +395,18 @@ impl Workspace {
                     orientation,
                     before,
                 } => {
-                    if self.move_tab(&tab, &group) {
-                        self.split_group(&group, orientation, before);
+                    let target_count = self.group_tab_count(&group);
+                    let same_target = self.group_has_tab(&group, &tab);
+                    if target_count.is_none()
+                        || target_count.unwrap_or(0) + usize::from(!same_target) < 2
+                    {
+                        effects.push(Effect::Error(
+                            "split requires two tabs in the target group".into(),
+                        ));
+                    } else if (same_target || self.move_tab(&tab, &group))
+                        && !self.split_group(&group, &tab, orientation, before)
+                    {
+                        effects.push(Effect::Error("split failed".into()));
                     }
                 }
                 DockTarget::Sidebar => {
@@ -430,8 +445,10 @@ impl Workspace {
                 }
             },
             Action::Focus { tab } => {
-                self.focus(&tab);
-                effects.push(Effect::Focus(tab));
+                if self.find_tab(&tab).is_some() {
+                    self.focus(&tab);
+                    effects.push(Effect::Focus(tab));
+                }
             }
             Action::Pin { tab, pinned } => {
                 if let Some(t) = self.find_tab_mut(&tab) {
@@ -539,7 +556,13 @@ impl Workspace {
         let mut groups = BTreeSet::new();
         let mut tabs = BTreeSet::new();
         self.windows.iter().all(|w| {
-            windows.insert(w.id.clone()) && valid_node_ids(&w.root, &mut groups, &mut tabs)
+            !w.id.is_empty()
+                && windows.insert(w.id.clone())
+                && valid_node_ids(&w.root, &mut groups, &mut tabs)
+        }) && self.focused.as_ref().is_none_or(|(window, tab)| {
+            self.windows
+                .iter()
+                .any(|w| &w.id == window && find_tab(&w.root, tab).is_some())
         })
     }
     fn feature_enabled(&self, f: Option<&str>) -> bool {
@@ -593,6 +616,17 @@ impl Workspace {
             .iter_mut()
             .find_map(|w| find_group_mut(&mut w.root, gid))
     }
+    fn group_tab_count(&self, gid: &str) -> Option<usize> {
+        self.windows
+            .iter()
+            .find_map(|w| find_group(&w.root, gid).map(|g| g.tabs.len()))
+    }
+    fn group_has_tab(&self, gid: &str, tab: &str) -> bool {
+        self.windows
+            .iter()
+            .find_map(|w| find_group(&w.root, gid))
+            .is_some_and(|g| g.tabs.iter().any(|t| t.id == tab))
+    }
     fn take_tab(&mut self, tab: &str) -> Option<Tab> {
         self.windows
             .iter_mut()
@@ -630,19 +664,27 @@ impl Workspace {
             false
         }
     }
-    fn split_group(&mut self, group: &str, orientation: Orientation, before: bool) {
+    fn split_group(
+        &mut self,
+        group: &str,
+        tab: &str,
+        orientation: Orientation,
+        before: bool,
+    ) -> bool {
         for w in &mut self.windows {
-            if split_group_node(&mut w.root, group, orientation, before) {
-                break;
+            if split_group_node(&mut w.root, group, tab, orientation, before) {
+                return true;
             }
         }
+        false
     }
-    fn split_tab(&mut self, tab: &str, o: Orientation) {
+    fn split_tab(&mut self, tab: &str, o: Orientation) -> bool {
         for w in &mut self.windows {
             if split_node(&mut w.root, tab, o) {
-                break;
+                return true;
             }
         }
+        false
     }
 }
 
@@ -669,9 +711,12 @@ fn valid_node(n: &LayoutNode) -> bool {
 fn valid_node_ids(n: &LayoutNode, groups: &mut BTreeSet<Id>, tabs: &mut BTreeSet<Id>) -> bool {
     match n {
         LayoutNode::Tabs(g) => {
-            groups.insert(g.id.clone())
+            !g.id.is_empty()
+                && groups.insert(g.id.clone())
                 && valid_node(n)
-                && g.tabs.iter().all(|t| tabs.insert(t.id.clone()))
+                && g.tabs
+                    .iter()
+                    .all(|t| !t.id.is_empty() && tabs.insert(t.id.clone()))
         }
         LayoutNode::Split { first, second, .. } => {
             valid_node_ids(first, groups, tabs) && valid_node_ids(second, groups, tabs)
@@ -711,6 +756,14 @@ fn find_tab<'a>(n: &'a LayoutNode, id: &str) -> Option<&'a Tab> {
         LayoutNode::Tabs(g) => g.tabs.iter().find(|t| t.id == id),
         LayoutNode::Split { first, second, .. } => {
             find_tab(first, id).or_else(|| find_tab(second, id))
+        }
+    }
+}
+fn find_group<'a>(n: &'a LayoutNode, id: &str) -> Option<&'a TabGroup> {
+    match n {
+        LayoutNode::Tabs(g) => (g.id == id).then_some(g),
+        LayoutNode::Split { first, second, .. } => {
+            find_group(first, id).or_else(|| find_group(second, id))
         }
     }
 }
@@ -754,29 +807,7 @@ fn take_tab(n: &mut LayoutNode, id: &str) -> Option<Tab> {
 fn split_node(n: &mut LayoutNode, tab: &str, o: Orientation) -> bool {
     match n {
         LayoutNode::Tabs(g) if g.tabs.iter().any(|t| t.id == tab) => {
-            let old = std::mem::replace(
-                n,
-                LayoutNode::Tabs(TabGroup {
-                    id: id(),
-                    tabs: vec![],
-                    active: 0,
-                    stacked: false,
-                    extras: ExtraFields::default(),
-                }),
-            );
-            *n = LayoutNode::Split {
-                orientation: o,
-                ratio: 0.5,
-                first: Box::new(old),
-                second: Box::new(LayoutNode::Tabs(TabGroup {
-                    id: id(),
-                    tabs: vec![],
-                    active: 0,
-                    stacked: false,
-                    extras: ExtraFields::default(),
-                })),
-            };
-            true
+            split_group_tabs(n, tab, o, false)
         }
         LayoutNode::Split { first, second, .. } => {
             split_node(first, tab, o) || split_node(second, tab, o)
@@ -784,48 +815,65 @@ fn split_node(n: &mut LayoutNode, tab: &str, o: Orientation) -> bool {
         _ => false,
     }
 }
-fn split_group_node(n: &mut LayoutNode, group: &str, o: Orientation, before: bool) -> bool {
+fn split_group_node(
+    n: &mut LayoutNode,
+    group: &str,
+    tab: &str,
+    o: Orientation,
+    before: bool,
+) -> bool {
     match n {
-        LayoutNode::Tabs(g) if g.id == group => {
-            let old = std::mem::replace(
-                n,
-                LayoutNode::Tabs(TabGroup {
-                    id: id(),
-                    tabs: vec![],
-                    active: 0,
-                    stacked: false,
-                    extras: ExtraFields::default(),
-                }),
-            );
-            let empty = LayoutNode::Tabs(TabGroup {
-                id: id(),
-                tabs: vec![],
-                active: 0,
-                stacked: false,
-                extras: ExtraFields::default(),
-            });
-            *n = if before {
-                LayoutNode::Split {
-                    orientation: o,
-                    ratio: 0.5,
-                    first: Box::new(empty),
-                    second: Box::new(old),
-                }
-            } else {
-                LayoutNode::Split {
-                    orientation: o,
-                    ratio: 0.5,
-                    first: Box::new(old),
-                    second: Box::new(empty),
-                }
-            };
-            true
-        }
+        LayoutNode::Tabs(g) if g.id == group => split_group_tabs(n, tab, o, before),
         LayoutNode::Split { first, second, .. } => {
-            split_group_node(first, group, o, before) || split_group_node(second, group, o, before)
+            split_group_node(first, group, tab, o, before)
+                || split_group_node(second, group, tab, o, before)
         }
         _ => false,
     }
+}
+fn split_group_tabs(n: &mut LayoutNode, tab: &str, o: Orientation, before: bool) -> bool {
+    let LayoutNode::Tabs(g) = n else { return false };
+    if g.tabs.len() < 2 {
+        return false;
+    }
+    let Some(index) = g.tabs.iter().position(|t| t.id == tab) else {
+        return false;
+    };
+    let moved = g.tabs.remove(index);
+    g.active = g.active.min(g.tabs.len() - 1);
+    let old = std::mem::replace(
+        n,
+        LayoutNode::Tabs(TabGroup {
+            id: id(),
+            tabs: vec![],
+            active: 0,
+            stacked: false,
+            extras: ExtraFields::default(),
+        }),
+    );
+    let sibling = LayoutNode::Tabs(TabGroup {
+        id: id(),
+        tabs: vec![moved],
+        active: 0,
+        stacked: false,
+        extras: ExtraFields::default(),
+    });
+    *n = if before {
+        LayoutNode::Split {
+            orientation: o,
+            ratio: 0.5,
+            first: Box::new(sibling),
+            second: Box::new(old),
+        }
+    } else {
+        LayoutNode::Split {
+            orientation: o,
+            ratio: 0.5,
+            first: Box::new(old),
+            second: Box::new(sibling),
+        }
+    };
+    true
 }
 fn remove_matching(n: &mut LayoutNode, predicate: impl Fn(&Tab) -> bool + Copy) {
     match n {
@@ -955,6 +1003,7 @@ mod tests {
     fn restore_and_unknown_view_report_actionable_errors() {
         let mut w = Workspace::default();
         w.view_kinds.insert("known".into());
+        let before = serde_json::to_string(&w).unwrap();
         assert!(matches!(
             w.dispatch(Action::Open {
                 window: None,
@@ -963,6 +1012,7 @@ mod tests {
             .as_slice(),
             [Effect::UnknownView(_)]
         ));
+        assert_eq!(serde_json::to_string(&w).unwrap(), before);
         assert!(matches!(
             w.dispatch(Action::Restore("not-json".into())).as_slice(),
             [Effect::Error(_)]
@@ -974,5 +1024,61 @@ mod tests {
             w.dispatch(Action::Restore(encoded)).as_slice(),
             [Effect::Error(_)]
         ));
+    }
+    #[test]
+    fn split_persists_two_nonempty_siblings_and_honors_before() {
+        let mut w = Workspace::default();
+        let a = tab(&mut w, "a");
+        let b = tab(&mut w, "b");
+        w.dispatch(Action::Split {
+            tab: b.clone(),
+            orientation: Orientation::Vertical,
+        });
+        assert!(w.validate());
+        fn sides(n: &LayoutNode, wanted: &str) -> Option<bool> {
+            match n {
+                LayoutNode::Split { first, second, .. } => Some(find_tab(first, wanted).is_some())
+                    .or_else(|| sides(first, wanted))
+                    .or_else(|| sides(second, wanted)),
+                LayoutNode::Tabs(_) => None,
+            }
+        }
+        assert_eq!(sides(&w.windows[0].root, &b), Some(false));
+        assert!(find_tab(&w.windows[0].root, &a).is_some());
+        let group = match &w.windows[0].root {
+            LayoutNode::Split { second, .. } => match &**second {
+                LayoutNode::Tabs(g) => g.id.clone(),
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        w.dispatch(Action::Dock {
+            tab: a,
+            target: DockTarget::Split {
+                group,
+                orientation: Orientation::Horizontal,
+                before: true,
+            },
+        });
+        assert!(w.validate());
+    }
+    #[test]
+    fn invalid_focus_and_ids_are_rejected() {
+        let mut w = Workspace::default();
+        let _ = tab(&mut w, "valid");
+        assert!(w
+            .dispatch(Action::Focus {
+                tab: "missing".into()
+            })
+            .is_empty());
+        w.windows[0].id.clear();
+        assert!(!w.validate());
+        let mut w = Workspace::default();
+        w.focused = Some(("wrong-window".into(), "wrong-tab".into()));
+        assert!(!w.validate());
+        if let LayoutNode::Tabs(g) = &mut w.windows[0].root {
+            g.id.clear();
+        }
+        assert!(!w.validate());
     }
 }
