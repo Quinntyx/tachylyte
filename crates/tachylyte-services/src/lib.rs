@@ -11,11 +11,12 @@ use std::{
     fmt,
     path::Path,
 };
+use url::Url;
 
 pub type ExtraFields = BTreeMap<String, Value>;
 
 /// A secret that cannot accidentally appear in logs or formatted errors.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 impl Secret {
     pub fn new(value: impl Into<String>) -> Self {
@@ -57,7 +58,9 @@ pub mod auth {
     #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct Session {
         pub state: SessionState,
+        #[serde(skip)]
         pub access_token: Option<Secret>,
+        #[serde(skip)]
         pub refresh_token: Option<Secret>,
         #[serde(flatten)]
         pub extra: ExtraFields,
@@ -81,6 +84,7 @@ pub mod auth {
     pub enum Error {
         InvalidTransition,
         MissingCredentials,
+        InvalidAccountId,
         TransportUnavailable,
     }
     impl fmt::Display for Error {
@@ -99,6 +103,8 @@ pub mod auth {
             }
         }
         pub fn begin_login(&mut self) -> Result<(), Error> {
+            self.access_token = None;
+            self.refresh_token = None;
             if matches!(
                 self.state,
                 SessionState::SignedOut | SessionState::Expired | SessionState::Degraded
@@ -115,16 +121,23 @@ pub mod auth {
             access: Secret,
             refresh: Option<Secret>,
         ) -> Result<(), Error> {
+            let account_id = account_id.into();
+            if account_id.trim().is_empty() || access.expose().is_empty() {
+                return Err(Error::InvalidAccountId);
+            }
             if matches!(self.state, SessionState::Authenticating) {
-                self.state = SessionState::Authenticated {
-                    account_id: account_id.into(),
-                };
+                self.state = SessionState::Authenticated { account_id };
                 self.access_token = Some(access);
                 self.refresh_token = refresh;
                 Ok(())
             } else {
                 Err(Error::InvalidTransition)
             }
+        }
+        pub fn failed(&mut self) {
+            self.state = SessionState::Degraded;
+            self.access_token = None;
+            self.refresh_token = None;
         }
         pub fn sign_out(&mut self) {
             self.state = SessionState::SignedOut;
@@ -181,6 +194,16 @@ pub mod sync {
         pub local: VersionVector,
         pub remote: VersionVector,
     }
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum Resolution {
+        KeepLocal,
+        KeepRemote,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ConflictError {
+        UnknownResource,
+        NotConcurrent,
+    }
     impl SyncPlan {
         pub fn new(policy: ConflictPolicy) -> Self {
             Self {
@@ -202,6 +225,19 @@ pub mod sync {
                 local,
                 remote,
             }
+        }
+        pub fn resolve(
+            &self,
+            conflict: &Conflict,
+            resolution: Resolution,
+        ) -> Result<Resolution, ConflictError> {
+            if !self.resources.iter().any(|r| r == &conflict.resource) {
+                return Err(ConflictError::UnknownResource);
+            }
+            if !conflict.local.concurrent(&conflict.remote) {
+                return Err(ConflictError::NotConcurrent);
+            }
+            Ok(resolution)
         }
     }
 }
@@ -234,8 +270,20 @@ pub mod publish {
         pub kind: DiffKind,
         pub digest: Option<String>,
     }
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SiteConfigDiff {
+        pub old: SiteConfig,
+        pub new: SiteConfig,
+    }
     pub fn diff(old: &PublishManifest, new: &PublishManifest) -> Vec<ManifestDiff> {
         let mut out = vec![];
+        if old.site != new.site {
+            out.push(ManifestDiff {
+                path: "[site-config]".into(),
+                kind: DiffKind::Changed,
+                digest: None,
+            });
+        }
         for (p, d) in &new.files {
             match old.files.get(p) {
                 None => out.push(ManifestDiff {
@@ -273,20 +321,25 @@ pub mod web {
     pub struct SafeUrl(String);
     impl SafeUrl {
         pub fn parse(raw: &str, policy: &NavigationPolicy) -> Result<Self, UrlError> {
-            let (scheme, rest) = raw.split_once("://").ok_or(UrlError::Malformed)?;
-            if !matches!(scheme.to_ascii_lowercase().as_str(), "https" | "http") {
+            if raw.chars().any(|c| c.is_control()) {
+                return Err(UrlError::Malformed);
+            }
+            let parsed = Url::parse(raw).map_err(|_| UrlError::Malformed)?;
+            if !matches!(parsed.scheme(), "https" | "http") {
                 return Err(UrlError::UnsafeScheme);
             }
-            let host = rest
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if host.is_empty() || (!policy.allow_external && !policy.allowed_hosts.contains(&host))
+            if parsed.username() != "" || parsed.password().is_some() || parsed.host_str().is_none()
             {
+                return Err(UrlError::Malformed);
+            }
+            let host = parsed.host_str().unwrap().to_ascii_lowercase();
+            if parsed.port().is_some_and(|p| p == 0) {
+                return Err(UrlError::Malformed);
+            }
+            if !policy.allow_external && !policy.allowed_hosts.contains(&host) {
                 return Err(UrlError::HostDenied);
             }
-            Ok(Self(raw.into()))
+            Ok(Self(parsed.to_string()))
         }
         pub fn as_str(&self) -> &str {
             &self.0
@@ -331,6 +384,10 @@ pub mod files {
     pub fn safe_relative(path: &str) -> Result<(), PathError> {
         let p = Path::new(path);
         if p.is_absolute()
+            || path.contains('\\')
+            || path.chars().any(char::is_control)
+            || (path.len() >= 2 && path.as_bytes()[1] == b':')
+            || path.starts_with("//")
             || p.components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
@@ -374,6 +431,15 @@ pub mod files {
 pub mod intents {
     use super::*;
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct VerificationEvidence {
+        pub algorithm: String,
+        pub key_id: String,
+        pub signature: String,
+    }
+    pub trait SignatureVerifier {
+        fn verify(&self, metadata: &UpdateMetadata) -> Option<VerificationEvidence>;
+    }
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     pub enum PrintIntent {
         Document { id: String },
         Selection { text: String },
@@ -386,8 +452,13 @@ pub mod intents {
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     pub enum UpdateState {
         Unknown,
-        Available { version: String },
-        Verified { version: String },
+        Available {
+            version: String,
+        },
+        Verified {
+            version: String,
+            evidence: VerificationEvidence,
+        },
         Rejected,
     }
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +466,9 @@ pub mod intents {
         pub version: String,
         pub digest: String,
         pub signature: Option<String>,
+        pub signature_algorithm: Option<String>,
+        pub key_id: Option<String>,
+        pub evidence: Option<String>,
         #[serde(flatten)]
         pub extra: ExtraFields,
     }
@@ -409,19 +483,25 @@ pub mod uri {
         pub params: BTreeMap<String, String>,
     }
     pub fn parse(raw: &str) -> Option<DeepLink> {
-        let (scheme, rest) = raw.split_once("://")?;
-        if scheme != "tachylyte" {
+        let parsed = Url::parse(raw).ok()?;
+        if parsed.scheme() != "tachylyte" || parsed.host_str()? != "app" {
             return None;
-        };
-        let (action, q) = rest.split_once('?').unwrap_or((rest, ""));
-        let params = q
-            .split('&')
-            .filter_map(|p| p.split_once('='))
-            .map(|(k, v)| (k.into(), v.into()))
+        }
+        let action = parsed.path_segments()?.next()?.to_string();
+        if action.is_empty()
+            || !action
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
+        }
+        let params = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         Some(DeepLink {
-            action: action.into(),
-            target: None,
+            action,
+            target: parsed.fragment().map(str::to_owned),
             params,
         })
     }
@@ -431,6 +511,31 @@ pub mod uri {
 pub struct TelemetryConsent {
     pub enabled: bool,
     pub explicit: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TelemetryEvent {
+    pub name: String,
+    pub fields: ExtraFields,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetryError {
+    NotConsented,
+    InvalidName,
+}
+pub fn record_telemetry(
+    consent: &TelemetryConsent,
+    mut event: TelemetryEvent,
+) -> Result<TelemetryEvent, TelemetryError> {
+    if !consent.explicit || !consent.enabled {
+        return Err(TelemetryError::NotConsented);
+    }
+    if event.name.is_empty() || event.name.chars().any(|c| c.is_control()) {
+        return Err(TelemetryError::InvalidName);
+    }
+    for key in ["token", "secret", "password", "credential"] {
+        event.fields.remove(key);
+    }
+    Ok(event)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformCapabilities {
@@ -452,8 +557,16 @@ impl MockTransport {
         self.responses.insert(key.into(), body);
     }
     pub fn request(&mut self, key: &str) -> Option<Vec<u8>> {
-        self.requests.push(key.into());
+        let safe_key = if key.contains("token=") || key.contains("secret=") {
+            "[REDACTED]"
+        } else {
+            key
+        };
+        self.requests.push(safe_key.into());
         self.responses.get(key).cloned()
+    }
+    pub fn request_with_secret(&mut self, key: &str, _secret: &Secret) -> Option<Vec<u8>> {
+        self.request(key)
     }
 }
 
@@ -513,5 +626,93 @@ mod tests {
         t.respond("x", vec![1]);
         assert_eq!(t.request("x"), Some(vec![1]));
         assert_eq!(t.requests, ["x"]);
+    }
+    #[test]
+    fn secrets_are_not_serialized_or_recorded() {
+        let s = auth::Session {
+            state: auth::SessionState::Authenticated {
+                account_id: "a".into(),
+            },
+            access_token: Some(Secret::new("raw")),
+            refresh_token: Some(Secret::new("refresh")),
+            extra: ExtraFields::new(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("raw"));
+        let mut t = MockTransport::default();
+        t.request_with_secret("token=raw", s.access_token.as_ref().unwrap());
+        assert_eq!(t.requests, ["[REDACTED]"]);
+    }
+    #[test]
+    fn auth_clears_and_validates() {
+        let mut s = auth::Session::signed_out();
+        s.begin_login().unwrap();
+        assert!(s.authenticated(" ", Secret::new("x"), None).is_err());
+        s.failed();
+        assert!(s.access_token.is_none());
+    }
+    #[test]
+    fn strict_url_and_paths() {
+        let p = web::NavigationPolicy {
+            allowed_hosts: ["[::1]".into(), "example.test".into()]
+                .into_iter()
+                .collect(),
+            allow_external: false,
+        };
+        assert!(web::navigation(&p, "https://user:pw@example.test").is_err());
+        assert!(web::navigation(&p, "https://[::1]:443/x").is_ok());
+        assert!(files::safe_relative(r"C:\\tmp\\x").is_err());
+        assert!(files::safe_relative("a\0b").is_err());
+    }
+    #[test]
+    fn conflict_site_telemetry_and_deeplink_boundaries() {
+        let mut plan = sync::SyncPlan::new(sync::ConflictPolicy::RequireReview);
+        plan.resources.push("doc".into());
+        let mut a = sync::VersionVector::default();
+        a.increment("a");
+        let mut b = sync::VersionVector::default();
+        b.increment("b");
+        assert!(plan
+            .resolve(&plan.conflict("doc", a, b), sync::Resolution::KeepLocal)
+            .is_ok());
+        let site = publish::SiteConfig {
+            title: "x".into(),
+            base_path: "/".into(),
+            extra: ExtraFields::new(),
+        };
+        let mut newer = publish::PublishManifest {
+            site: site.clone(),
+            files: BTreeMap::new(),
+            extra: ExtraFields::new(),
+        };
+        newer.site.title = "y".into();
+        let old = publish::PublishManifest {
+            site,
+            files: BTreeMap::new(),
+            extra: ExtraFields::new(),
+        };
+        assert_eq!(publish::diff(&old, &newer).len(), 1);
+        let event = TelemetryEvent {
+            name: "x".into(),
+            fields: [("token".into(), Value::String("x".into()))]
+                .into_iter()
+                .collect(),
+        };
+        assert!(record_telemetry(&TelemetryConsent::default(), event.clone()).is_err());
+        let c = TelemetryConsent {
+            enabled: true,
+            explicit: true,
+        };
+        assert!(!record_telemetry(&c, event)
+            .unwrap()
+            .fields
+            .contains_key("token"));
+        assert_eq!(
+            uri::parse("tachylyte://app/open?target=a%20b#x")
+                .unwrap()
+                .params["target"],
+            "a b"
+        );
+        assert!(uri::parse("tachylyte://app/bad%20x").is_none());
     }
 }
