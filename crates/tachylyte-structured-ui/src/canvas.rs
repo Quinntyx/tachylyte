@@ -247,18 +247,51 @@ impl CanvasView {
     pub fn new(model: CanvasModel) -> Self {
         Self { model }
     }
+
+    /// Construct a Canvas view directly from a document for composite mounting.
+    pub fn from_document(document: CanvasDocument) -> Self {
+        Self::new(CanvasModel::new(document))
+    }
+
+    /// Replace the displayed document while retaining viewport and selection state.
+    pub fn update_document(&mut self, document: CanvasDocument) {
+        self.model.document = document;
+        self.model
+            .selected
+            .retain(|id| self.model.document.node(id).is_some());
+    }
+
+    /// Enable or disable interaction without rebuilding the mounted view.
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.model.disabled = disabled;
+    }
+
+    /// Forward a pointer press from a composite host to the canvas model.
+    pub fn pointer_down(&mut self, screen: ScreenPoint) -> Option<String> {
+        self.model.pointer_down(screen)
+    }
+
+    /// Forward a pointer delta from a composite host to the canvas model.
+    pub fn pointer_move(&mut self, delta: ScreenPoint) {
+        self.model.pointer_move(delta);
+    }
+
+    /// Drain commands emitted by this view since the previous call.
+    pub fn take_commands(&mut self) -> Vec<CanvasCommand> {
+        self.model.take_commands()
+    }
 }
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dark = 0x202124ff;
-        let node_bg = 0x3b4252ff;
-        let selected = 0x88c0d0ff;
+        let canvas_bg = 0xfafaf9ff;
+        let node_bg = 0xfffdf9ff;
+        let selected = 0xf1eee8ff;
         let entity = cx.entity();
         let mut viewport = div()
             .id("canvas-viewport")
             .relative()
             .flex_1()
-            .bg(rgb(dark))
+            .bg(rgb(canvas_bg))
             .overflow_hidden();
         // A fixed-size grid keeps the viewport legible while remaining deterministic.
         for i in 0..32 {
@@ -270,7 +303,7 @@ impl Render for CanvasView {
                     .top(px(0.))
                     .w(px(1.))
                     .h(px(4096.))
-                    .bg(rgb(0x2a2d32ff)),
+                    .bg(rgb(0xe4e2ddff)),
             );
             viewport = viewport.child(
                 div()
@@ -279,7 +312,7 @@ impl Render for CanvasView {
                     .top(px(offset))
                     .w(px(4096.))
                     .h(px(1.))
-                    .bg(rgb(0x2a2d32ff)),
+                    .bg(rgb(0xe4e2ddff)),
             );
         }
         // Edges are represented by deterministic midpoint connectors. A host can
@@ -295,7 +328,7 @@ impl Render for CanvasView {
                         .top(px(start.y as f32))
                         .w(px((end.x - start.x).abs().max(1.) as f32))
                         .h(px(1.))
-                        .bg(rgb(0x8fbcbbff))
+                        .bg(rgb(0xb8b5adff))
                 } else {
                     div()
                         .absolute()
@@ -303,7 +336,7 @@ impl Render for CanvasView {
                         .top(px(start.y.min(end.y) as f32))
                         .w(px(1.))
                         .h(px((end.y - start.y).abs().max(1.) as f32))
-                        .bg(rgb(0x8fbcbbff))
+                        .bg(rgb(0xb8b5adff))
                 });
             }
         }
@@ -327,9 +360,9 @@ impl Render for CanvasView {
                 .h(px(h as f32))
                 .bg(rgb(if active { selected } else { node_bg }))
                 .border_1()
-                .border_color(rgb(if active { 0xffffffff } else { 0x687080ff }))
+                .border_color(rgb(if active { 0x8f887bff } else { 0xd6d3ccff }))
                 .p_2()
-                .text_color(rgb(0xffffffff))
+                .text_color(rgb(0x222222ff))
                 .child(label)
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     e.update(cx, |view, cx| {
@@ -346,11 +379,19 @@ impl Render for CanvasView {
         let select = entity.clone();
         let pan = entity.clone();
         let connect = entity.clone();
+        let canvas_empty = self.model.document.nodes.is_empty();
+        let status = if self.model.disabled {
+            "Canvas unavailable"
+        } else if canvas_empty {
+            "No nodes to display"
+        } else {
+            ""
+        };
         div()
             .flex()
             .flex_col()
             .size_full()
-            .text_color(rgb(0xffffffff))
+            .text_color(rgb(0x222222ff))
             .child(
                 div()
                     .h(px(36.))
@@ -358,12 +399,18 @@ impl Render for CanvasView {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .bg(rgb(0x30343bff))
+                    .bg(rgb(0xffffffff))
+                    .border_b_1()
+                    .border_color(rgb(0xe0e0e0ff))
+                    .text_color(rgb(0x222222ff))
                     .child("Canvas")
                     .child(
                         div()
                             .id("canvas-select")
-                            .p_1()
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
                             .child("Select")
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 select.update(cx, |v, cx| {
@@ -372,20 +419,29 @@ impl Render for CanvasView {
                                 });
                             }),
                     )
-                    .child(div().id("canvas-pan").p_1().child("Pan").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            pan.update(cx, |v, cx| {
-                                v.model.set_mode(CanvasMode::Pan);
-                                cx.notify();
-                            });
-                        },
-                    ))
+                    .child(
+                        div()
+                            .id("canvas-pan")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("✋ Pan")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                pan.update(cx, |v, cx| {
+                                    v.model.set_mode(CanvasMode::Pan);
+                                    cx.notify();
+                                });
+                            }),
+                    )
                     .child(
                         div()
                             .id("canvas-connect")
-                            .p_1()
-                            .child("Connect")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("⌁ Connect")
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 connect.update(cx, |v, cx| {
                                     v.model.set_mode(CanvasMode::Connect);
@@ -393,18 +449,39 @@ impl Render for CanvasView {
                                 });
                             }),
                     )
-                    .child(div().id("canvas-zoom-in").p_1().child("+").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            e.update(cx, |v, cx| {
-                                v.model.zoom(ScreenPoint { x: 400., y: 250. }, 1.1);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child("Pan · Select · Connect"),
+                    .child(
+                        div()
+                            .id("canvas-zoom-in")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("＋")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                e.update(cx, |v, cx| {
+                                    v.model.zoom(ScreenPoint { x: 400., y: 250. }, 1.1);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child("  ·  ⌕ Zoom"),
             )
-            .child(viewport)
+            .child(if status.is_empty() {
+                viewport
+            } else {
+                viewport.child(
+                    div()
+                        .absolute()
+                        .top(px(24.))
+                        .left(px(24.))
+                        .p_3()
+                        .bg(rgb(0xfffdf9ff))
+                        .border_1()
+                        .border_color(rgb(0xd6d3ccff))
+                        .text_color(rgb(0x68645dff))
+                        .child(status),
+                )
+            })
     }
 }
 
