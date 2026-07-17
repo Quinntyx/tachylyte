@@ -1,0 +1,11 @@
+[package]
+name = "tachylyte-launcher-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "App-facing launcher state facade"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tachylyte-vaults = { path = "../tachylyte-vaults" }

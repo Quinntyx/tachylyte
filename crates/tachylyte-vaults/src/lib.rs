@@ -53,6 +53,14 @@ fn status_for(path: &Path) -> VaultStatus {
 struct RegistryFile {
     #[serde(default)]
     vaults: Vec<VaultEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appearance: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    features: Option<Value>,
     #[serde(flatten)]
     extra: ExtraFields,
 }
@@ -61,6 +69,29 @@ struct RegistryFile {
 pub struct RevealIntent {
     pub path: PathBuf,
 }
+
+/// Records removed by stale pruning; retain this value to offer an undo action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoPrune {
+    pub removed: Vec<VaultEntry>,
+    pub selected: Option<String>,
+    pub default: Option<String>,
+}
+
+/// A validated existing directory. Constructing a plan never writes to disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenVaultPlan {
+    pub path: PathBuf,
+}
+
+/// A filesystem-free plan for the optional Welcome note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WelcomeSeedPlan {
+    pub path: PathBuf,
+    pub content: &'static str,
+}
+
+pub const WELCOME_SEED: &str = "# Welcome to Tachylyte\n\nTachylyte is a local Markdown workspace.\n\n## Getting started\n\n- Create notes and folders from the workspace shell.\n- Edit Markdown in the source view.\n- Use search to find notes in this vault.\n\nYour notes stay on disk in this vault directory.\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateVaultPlan {
@@ -134,7 +165,7 @@ impl VaultManager {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let config_path = path.into();
         let file = if config_path.exists() {
-            serde_json::from_slice(&fs::read(&config_path)?)?
+            parse_registry(&fs::read(&config_path)?)?
         } else {
             RegistryFile::default()
         };
@@ -157,10 +188,143 @@ impl VaultManager {
         v
     }
     pub fn default_vault(&self) -> Option<&VaultEntry> {
+        if let Some(id) = self
+            .file
+            .default
+            .as_deref()
+            .or(self.file.selected.as_deref())
+        {
+            if let Some(v) = self.vaults().iter().find(|v| v.id == id) {
+                return Some(v);
+            }
+        }
         self.recent()
             .into_iter()
             .find(|v| v.status() == VaultStatus::Available)
             .or_else(|| self.recent().into_iter().next())
+    }
+    pub fn selected_vault(&self) -> Option<&VaultEntry> {
+        self.file
+            .selected
+            .as_deref()
+            .and_then(|id| self.vaults().iter().find(|v| v.id == id))
+    }
+    pub fn selected_id(&self) -> Option<&str> {
+        self.file.selected.as_deref()
+    }
+    pub fn set_default_vault(&mut self, id: &str) -> Result<(), Error> {
+        if !self.file.vaults.iter().any(|v| v.id == id) {
+            return Err(Error::NotFound(id.into()));
+        }
+        let mut c = self.file.clone();
+        c.default = Some(id.into());
+        c.selected = Some(id.into());
+        self.commit(c)
+    }
+    pub fn set_selected_vault(&mut self, id: &str) -> Result<(), Error> {
+        if !self.file.vaults.iter().any(|v| v.id == id) {
+            return Err(Error::NotFound(id.into()));
+        }
+        let mut c = self.file.clone();
+        c.selected = Some(id.into());
+        self.commit(c)
+    }
+    /// Validate an existing directory for the Open action without mutating it.
+    pub fn plan_open_vault(&self, path: impl Into<PathBuf>) -> Result<OpenVaultPlan, Error> {
+        let path = path.into();
+        if plan_validation::validate_open_vault_path(&path).is_err() {
+            return Err(Error::InvalidParent);
+        }
+        Ok(OpenVaultPlan { path })
+    }
+    /// Register a previously validated Open plan.
+    pub fn execute_open_vault(&mut self, plan: &OpenVaultPlan) -> Result<VaultEntry, Error> {
+        if !plan.path.is_dir() {
+            return Err(Error::InvalidParent);
+        }
+        self.import_folder(&plan.path)
+    }
+    /// Prepare the Welcome note without creating or overwriting a file.
+    pub fn plan_welcome_seed(
+        &self,
+        root: impl AsRef<Path>,
+    ) -> Result<Option<WelcomeSeedPlan>, Error> {
+        let root = root.as_ref();
+        let Some(plan) = plan_validation::plan_welcome_seed(root).map_err(Error::Io)? else {
+            return Ok(None);
+        };
+        Ok(Some(WelcomeSeedPlan {
+            path: plan.path,
+            content: plan.content,
+        }))
+    }
+    pub fn appearance(&self) -> Option<&Value> {
+        self.file.appearance.as_ref()
+    }
+    pub fn feature_settings(&self) -> Option<&Value> {
+        self.file.features.as_ref()
+    }
+    pub fn set_appearance(&mut self, value: Value) -> Result<(), Error> {
+        let mut c = self.file.clone();
+        c.appearance = Some(value);
+        self.commit(c)
+    }
+    pub fn set_feature_settings(&mut self, value: Value) -> Result<(), Error> {
+        let mut c = self.file.clone();
+        c.features = Some(value);
+        self.commit(c)
+    }
+    pub fn prune_stale(&mut self) -> Result<UndoPrune, Error> {
+        let mut c = self.file.clone();
+        let mut removed = Vec::new();
+        let selected = c.selected.clone();
+        let default = c.default.clone();
+        c.vaults.retain(|v| {
+            let keep = v.status() == VaultStatus::Available;
+            if !keep {
+                removed.push(v.clone());
+            }
+            keep
+        });
+        if let Some(id) = c.selected.as_deref() {
+            if !c.vaults.iter().any(|v| v.id == id) {
+                c.selected = None;
+            }
+        }
+        if let Some(id) = c.default.as_deref() {
+            if !c.vaults.iter().any(|v| v.id == id) {
+                c.default = None;
+            }
+        }
+        self.commit(c)?;
+        Ok(UndoPrune {
+            removed,
+            selected,
+            default,
+        })
+    }
+    pub fn undo_prune(&mut self, undo: UndoPrune) -> Result<(), Error> {
+        let mut c = self.file.clone();
+        for v in undo.removed {
+            if !c
+                .vaults
+                .iter()
+                .any(|x| same_path(Path::new(&x.path), Path::new(&v.path)))
+            {
+                c.vaults.push(v);
+            }
+        }
+        if let Some(id) = undo.selected {
+            if c.vaults.iter().any(|v| v.id == id) {
+                c.selected = Some(id);
+            }
+        }
+        if let Some(id) = undo.default {
+            if c.vaults.iter().any(|v| v.id == id) {
+                c.default = Some(id);
+            }
+        }
+        self.commit(c)
     }
     pub fn persist(&self) -> Result<(), Error> {
         self.persist_file(&self.file)
@@ -225,7 +389,21 @@ impl VaultManager {
             return Err(Error::InvalidParent);
         }
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("Vault");
-        self.add(name, p)
+        let mut entry = self.add(name, p)?;
+        if p.join(".obsidian").is_dir() {
+            let mut c = self.file.clone();
+            if let Some(v) = c.vaults.iter_mut().find(|v| v.id == entry.id) {
+                let metadata = plan_validation::read_obsidian_app_metadata(p)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                v.extra
+                    .insert("obsidian".into(), metadata.unwrap_or(Value::Bool(true)));
+                entry = v.clone();
+            }
+            self.commit(c)?;
+        }
+        Ok(entry)
     }
     pub fn open_vault(&mut self, id: &str) -> Result<VaultEntry, Error> {
         let mut candidate = self.file.clone();
@@ -235,6 +413,7 @@ impl VaultManager {
             .find(|v| v.id == id)
             .ok_or_else(|| Error::NotFound(id.into()))?;
         v.last_opened = now();
+        candidate.selected = Some(id.to_owned());
         let out = v.clone();
         self.commit(candidate)?;
         Ok(out)
@@ -247,8 +426,29 @@ impl VaultManager {
             .position(|v| v.id == id)
             .ok_or_else(|| Error::NotFound(id.into()))?;
         let out = candidate.vaults.remove(i);
+        if candidate.selected.as_deref() == Some(id) {
+            candidate.selected = None;
+        }
+        if candidate.default.as_deref() == Some(id) {
+            candidate.default = None;
+        }
         self.commit(candidate)?;
         Ok(out)
+    }
+    /// Restore a previously removed entry for an undo action.
+    pub fn restore_entry(&mut self, entry: VaultEntry) -> Result<VaultEntry, Error> {
+        if let Some(existing) = self
+            .file
+            .vaults
+            .iter()
+            .find(|v| same_path(Path::new(&v.path), Path::new(&entry.path)))
+        {
+            return Ok(existing.clone());
+        }
+        let mut candidate = self.file.clone();
+        candidate.vaults.push(entry.clone());
+        self.commit(candidate)?;
+        Ok(entry)
     }
     pub fn rename_display_name(
         &mut self,
@@ -318,6 +518,12 @@ impl VaultManager {
                 .iter_mut()
                 .find(|x: &&mut VaultEntry| same_path(Path::new(&x.path), Path::new(&v.path)))
             {
+                if self.file.selected.as_deref() == Some(&v.id) {
+                    self.file.selected = Some(existing.id.clone());
+                }
+                if self.file.default.as_deref() == Some(&v.id) {
+                    self.file.default = Some(existing.id.clone());
+                }
                 merge_entry(existing, v);
             } else {
                 out.push(v);
@@ -353,6 +559,97 @@ fn merge_entry(existing: &mut VaultEntry, duplicate: VaultEntry) {
     }
 }
 
+fn parse_registry(bytes: &[u8]) -> Result<RegistryFile, Error> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    // Older releases wrote the vault list directly, or used recentVaults/
+    // recent_vaults. Normalize those forms while preserving object extensions.
+    let mut file = match value {
+        Value::Array(vaults) => RegistryFile {
+            vaults: parse_entries(vaults)?,
+            ..Default::default()
+        },
+        Value::Object(mut object) => {
+            for (alias, canonical) in [
+                ("selectedVault", "selected"),
+                ("selected_vault", "selected"),
+                ("defaultVault", "default"),
+                ("default_vault", "default"),
+            ] {
+                if !object.contains_key(canonical) {
+                    if let Some(value) = object.remove(alias) {
+                        object.insert(canonical.into(), value);
+                    }
+                }
+            }
+            if !object.contains_key("vaults") {
+                for key in ["recentVaults", "recent_vaults", "recent"] {
+                    if let Some(v) = object.get(key).cloned() {
+                        object.insert("vaults".into(), v);
+                        break;
+                    }
+                }
+            }
+            if !object.contains_key("appearance") {
+                if let Some(settings) = object.get("settings").cloned() {
+                    object.insert("appearance".into(), settings);
+                }
+            }
+            if !object.contains_key("features") {
+                if let Some(Value::Object(settings)) = object.get("settings") {
+                    if let Some(features) = settings.get("features") {
+                        object.insert("features".into(), features.clone());
+                    }
+                }
+            }
+            let entries = object.remove("vaults").unwrap_or(Value::Array(Vec::new()));
+            let mut file: RegistryFile = serde_json::from_value(Value::Object(object))?;
+            file.vaults = match entries {
+                Value::Array(v) => parse_entries(v)?,
+                _ => Vec::new(),
+            };
+            file
+        }
+        _ => RegistryFile::default(),
+    };
+    for v in &mut file.vaults {
+        if v.id.trim().is_empty() {
+            v.id = new_id(Path::new(&v.path));
+        }
+        if v.name.trim().is_empty() {
+            v.name = Path::new(&v.path)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("Vault")
+                .into();
+        }
+    }
+    Ok(file)
+}
+
+fn parse_entries(values: Vec<Value>) -> Result<Vec<VaultEntry>, Error> {
+    values
+        .into_iter()
+        .map(|mut value| {
+            if let Value::Object(ref mut o) = value {
+                if !o.contains_key("path") {
+                    if let Some(v) = o.remove("location").or_else(|| o.remove("folder")) {
+                        o.insert("path".into(), v);
+                    }
+                }
+                o.entry("id")
+                    .or_insert_with(|| Value::String(String::new()));
+                o.entry("name")
+                    .or_insert_with(|| Value::String(String::new()));
+                if !o.contains_key("last_opened") {
+                    let opened = o.remove("lastOpened").unwrap_or(Value::Number(0.into()));
+                    o.insert("last_opened".into(), opened);
+                }
+            }
+            Ok(serde_json::from_value(value)?)
+        })
+        .collect()
+}
+
 fn valid_name(s: &str) -> bool {
     !s.trim().is_empty()
         && s != "."
@@ -383,9 +680,15 @@ fn canonical_or_normalized(path: &Path) -> Result<PathBuf, Error> {
     }
 }
 fn new_id(path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    now().hash(&mut h);
-    format!("{:016x}", h.finish())
+    // FNV-1a is deliberately specified here instead of relying on a
+    // language/runtime hasher whose seed or algorithm may change between
+    // platforms and releases.  The path itself is canonicalized by callers
+    // before reaching this function, so the ID is stable across reloads.
+    let portable_path = canonical_or_normalized(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in portable_path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
