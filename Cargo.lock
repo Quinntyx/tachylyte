@@ -5396,6 +5396,7 @@ dependencies = [
  "tachylyte-core",
  "tachylyte-knowledge",
  "tachylyte-markdown",
+ "tachylyte-theme",
  "tempfile",
 ]
 
