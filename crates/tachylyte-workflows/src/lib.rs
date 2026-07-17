@@ -584,16 +584,10 @@ pub fn retention_plan(mut snapshots: Vec<Snapshot>, keep: usize) -> RecoveryPlan
     }
 }
 pub fn restore_plan(snapshot: &Snapshot, current: &str) -> Result<ConversionPlan> {
-    if snapshot.content == current {
-        return Ok(ConversionPlan {
-            output: current.into(),
-            warnings: vec!["snapshot is already current".into()],
-        });
-    }
-    Ok(ConversionPlan {
-        output: snapshot.content.clone(),
-        warnings: vec![format!("restore revision {}", snapshot.revision)],
-    })
+    let _ = (snapshot, current);
+    Err(WorkflowError::RestorePrecondition(
+        "restore requires revision and current-content checksum; use restore_plan_checked".into(),
+    ))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RestorePlan {
