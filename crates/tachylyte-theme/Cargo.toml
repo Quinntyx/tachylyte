@@ -1,0 +1,10 @@
+[package]
+name = "tachylyte-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Obsidian-inspired design tokens for Tachylyte"
+
+[dependencies]
+gpui.workspace = true
+serde = { version = "1", features = ["derive"] }
