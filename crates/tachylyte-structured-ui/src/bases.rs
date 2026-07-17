@@ -210,7 +210,27 @@ impl Render for BasesView {
         let entity = cx.entity();
         let projection = self.model.projection();
         let selected = self.model.selected;
-        let mut body = div().flex().flex_col().gap_1().p_2();
+        let columns = projection.columns.clone();
+        let row_count = projection.rows.len();
+        let mut body = div().flex().flex_col().p_2().bg(rgb(0xffffffd9));
+        if !columns.is_empty() {
+            let headings = columns
+                .iter()
+                .map(|column| format!("▦  {column}"))
+                .collect::<Vec<_>>()
+                .join("     ");
+            body = body.child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_color(rgb(0x5c5c5cff))
+                    .border_b_1()
+                    .border_color(rgb(0xe0e0e0ff))
+                    .child(headings),
+            );
+        }
         for row in projection.rows {
             let active = selected == Some(row.source_index);
             let text = row
@@ -224,9 +244,15 @@ impl Render for BasesView {
             let child = div()
                 .id(SharedString::from(format!("base-row-{index}")))
                 .w_full()
-                .p_2()
-                .bg(rgb(if active { 0x3e5c76ff } else { 0x292d35ff }))
-                .text_color(rgb(0xffffffff))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .px_2()
+                .border_b_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .bg(rgb(if active { 0xeee7f7ff } else { 0xffffffff }))
+                .text_color(rgb(if active { 0x6b3fa0ff } else { 0x222222ff }))
+                .hover(|style| style.bg(rgb(0xeeeeeeff)))
                 .child(text)
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     e.update(cx, |view, cx| {
@@ -235,6 +261,14 @@ impl Render for BasesView {
                     });
                 });
             body = body.child(child);
+        }
+        if row_count == 0 {
+            body = body.child(
+                div()
+                    .p_2()
+                    .text_color(rgb(0x5c5c5cff))
+                    .child("No records yet"),
+            );
         }
         let e = entity.clone();
         let cards = entity.clone();
@@ -246,53 +280,82 @@ impl Render for BasesView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x202124ff))
-            .text_color(rgb(0xffffffff))
+            .bg(rgb(0xf6f6f6ff))
+            .text_color(rgb(0x222222ff))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(px(36.))
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .bg(rgb(0x30343bff))
+                    .bg(rgb(0xffffffff))
+                    .border_b_1()
+                    .border_color(rgb(0xe0e0e0ff))
                     .child(if disabled {
-                        "Bases (disabled)"
+                        "▦  Bases (disabled)"
                     } else {
-                        "Bases"
+                        "▦  Bases"
                     })
-                    .child(div().id("bases-table").p_1().child("Table").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            e.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::Table);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(div().id("bases-cards").p_1().child("Cards").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            cards.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::Cards);
-                                cx.notify();
-                            });
-                        },
-                    ))
-                    .child(div().id("bases-list").p_1().child("List").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            list.update(cx, |v, cx| {
-                                v.model.set_layout(BaseLayout::List);
-                                cx.notify();
-                            });
-                        },
-                    ))
+                    .child(
+                        div()
+                            .id("bases-table")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("▤ Table")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                e.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::Table);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("bases-cards")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("▦ Cards")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                cards.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::Cards);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("bases-list")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("☷ List")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                list.update(cx, |v, cx| {
+                                    v.model.set_layout(BaseLayout::List);
+                                    cx.notify();
+                                });
+                            }),
+                    )
                     .child(
                         div()
                             .id("bases-filter")
-                            .p_1()
-                            .child("Filter")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .border_1()
+                            .border_color(rgb(0xe0e0e0ff))
+                            .bg(rgb(0xfafafaff))
+                            .child(if self.model.filter.is_empty() {
+                                "⌕  Filter"
+                            } else {
+                                "⌕  Filtered"
+                            })
                             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                                 filter.update(cx, |v, cx| {
                                     v.model.set_filter("");
@@ -300,19 +363,25 @@ impl Render for BasesView {
                                 });
                             }),
                     )
-                    .child(div().id("bases-sort").p_1().child("Sort").on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, _, cx| {
-                            sort.update(cx, |v, cx| {
-                                if let Some(property) =
-                                    v.model.projection().columns.first().cloned()
-                                {
-                                    v.model.set_sort(property, Direction::Asc);
-                                }
-                                cx.notify();
-                            });
-                        },
-                    )),
+                    .child(
+                        div()
+                            .id("bases-sort")
+                            .h(px(28.))
+                            .px_2()
+                            .items_center()
+                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
+                            .child("↕ Sort")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                sort.update(cx, |v, cx| {
+                                    if let Some(property) =
+                                        v.model.projection().columns.first().cloned()
+                                    {
+                                        v.model.set_sort(property, Direction::Asc);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    ),
             )
             .child(body)
     }

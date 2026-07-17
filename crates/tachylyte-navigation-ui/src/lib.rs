@@ -4,7 +4,7 @@
 //! snapshots from `tachylyte-core`/`tachylyte-knowledge`, reduce actions, and subscribe to
 //! the small event vocabulary below.
 
-use gpui::{div, prelude::*, Context, Entity, Render, Window};
+use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, Window};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
@@ -399,17 +399,29 @@ fn render_navigation_content<E: PaneActivation + 'static>(
             .child(format!("{} unavailable", pane.title));
     }
     let title = pane.title.clone();
+    let count = pane.visible().len();
+    let filter = pane.state.filter.clone();
     let rows = pane.visible().into_iter().enumerate().map(|(i, item)| {
         let id = item.id.clone();
         let mut row = div()
             .id(("navigation-row", i))
             .focusable()
             .tab_index(i as isize)
-            .p_1()
-            .child(if i == pane.state.selected {
-                format!("selected: {}", item.label)
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_color(rgb(if i == pane.state.selected {
+                0x6b3fa0ff
             } else {
-                item.label.clone()
+                0x222222ff
+            }))
+            .hover(|style| style.bg(rgb(0xeeeeeeff)))
+            .child(if i == pane.state.selected {
+                format!("●  {}", item.label)
+            } else {
+                format!("   {}", item.label)
             });
         let target = target.clone();
         row = row.on_click(move |_, _, cx| {
@@ -429,8 +441,53 @@ fn render_navigation_content<E: PaneActivation + 'static>(
         .on_key_down(move |event, _, app| reduce_key(&key_target, &event.keystroke.key, app))
         .flex()
         .flex_col()
-        .child(title)
+        .bg(rgb(0xf6f6f6ff))
+        .text_color(rgb(0x222222ff))
+        .child(
+            div()
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_2()
+                .border_b_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .child(format!("☰  {title}"))
+                .child(
+                    div()
+                        .px_1()
+                        .text_color(rgb(0x5c5c5cff))
+                        .child(count.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .mx_2()
+                .my_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .px_2()
+                .border_1()
+                .border_color(rgb(0xe0e0e0ff))
+                .bg(rgb(0xffffffff))
+                .text_color(rgb(0x5c5c5cff))
+                .child(if filter.is_empty() {
+                    "⌕  Search"
+                } else {
+                    "⌕  Filtered"
+                }),
+        )
         .children(rows)
+        .child(if count == 0 {
+            div()
+                .px_2()
+                .py_2()
+                .text_color(rgb(0x5c5c5cff))
+                .child("Nothing here yet")
+        } else {
+            div()
+        })
 }
 
 macro_rules! pane_view {
