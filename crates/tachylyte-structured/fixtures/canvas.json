@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    { "id": "welcome", "type": "text", "x": 0, "y": 0, "width": 240, "height": 80, "text": "Welcome", "color": "1", "vendorExtension": { "kept": true } },
+    { "id": "guide", "type": "file", "x": 300, "y": 0, "width": 240, "height": 80, "file": "Guide.md" }
+  ],
+  "edges": [{ "id": "welcome-guide", "fromNode": "welcome", "fromSide": "right", "toNode": "guide", "toSide": "left", "label": "read" }],
+  "vendorCanvasExtension": "preserved"
+}
