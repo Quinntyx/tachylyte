@@ -5,8 +5,8 @@
 
 #[cfg(target_os = "linux")]
 use rustix::fs::{
-    fsync, openat, openat2, renameat, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags,
-    ResolveFlags,
+    fsync, mkdirat, openat, openat2, renameat, renameat_with, unlinkat, AtFlags, Mode, OFlags,
+    RenameFlags, ResolveFlags,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -192,8 +192,7 @@ impl Vault {
         {
             let p = self.checked(path, true)?;
             let parent = p.parent().unwrap();
-            fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-            let (dir, name) = linux_parent(self, path)?;
+            let (dir, name) = linux_parent_mut(self, path)?;
             let tmp = format!(".tachylyte-{}.tmp", unique_suffix());
             let fd = openat(
                 &dir,
@@ -222,7 +221,9 @@ impl Vault {
         #[allow(unreachable_code)]
         let p = self.checked(path, true)?;
         let parent = p.parent().unwrap();
-        fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        return Err(CoreError::Unsupported(
+            "secure mutations require Linux openat2 in this build".into(),
+        ));
         let tmp = unique_temp(parent);
         {
             use std::io::Write;
@@ -248,8 +249,7 @@ impl Vault {
         {
             let p = self.checked(path, true)?;
             let parent = p.parent().unwrap();
-            fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-            let (dir, name) = linux_parent(self, path)?;
+            let (dir, name) = linux_parent_mut(self, path)?;
             let tmp = format!(".tachylyte-{}.tmp", unique_suffix());
             let fd = openat(
                 &dir,
@@ -283,7 +283,9 @@ impl Vault {
         #[allow(unreachable_code)]
         let p = self.checked(path, true)?;
         let parent = p.parent().unwrap();
-        fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+        return Err(CoreError::Unsupported(
+            "secure mutations require Linux openat2 in this build".into(),
+        ));
         let tmp = unique_temp(parent);
         {
             use std::io::Write;
@@ -316,11 +318,9 @@ impl Vault {
         {
             let a = self.checked(from, false)?;
             let b = self.checked(to, true)?;
-            if let Some(parent) = b.parent() {
-                fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
-            }
+            let _ = b.parent();
             let (src_dir, src_name) = linux_parent(self, from)?;
-            let (dst_dir, dst_name) = linux_parent(self, to)?;
+            let (dst_dir, dst_name) = linux_parent_mut(self, to)?;
             renameat_with(
                 &src_dir,
                 src_name,
@@ -354,7 +354,9 @@ impl Vault {
             return Err(CoreError::Duplicate(to.0.clone()));
         }
         if let Some(parent) = b.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
         }
         let metadata = fs::symlink_metadata(&a).map_err(|e| io_at(&a, e))?;
         if metadata.is_dir() {
@@ -415,13 +417,10 @@ impl Vault {
         {
             let from = self.checked(path, false)?;
             let dir_path = self.root.join(".trash");
-            match fs::symlink_metadata(&dir_path) {
-                Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-                Ok(m) if m.file_type().is_symlink() => return Err(CoreError::Symlink(dir_path)),
-                Ok(_) => return Err(CoreError::InvalidPath(".trash is not a directory".into())),
-                Err(e) => fs::create_dir(&dir_path)
-                    .map_err(|x| io_at(&dir_path, x))
-                    .or(Err(io_at(&dir_path, e)))?,
+            if let Ok(meta) = fs::symlink_metadata(&dir_path) {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::Symlink(dir_path));
+                }
             }
             let name = path
                 .as_path()
@@ -430,7 +429,7 @@ impl Vault {
             let dest_path = PathBuf::from(".trash").join(name);
             let dest_vault_path = VaultPath::new(&dest_path).unwrap();
             let (src_dir, src_name) = linux_parent(self, path)?;
-            let (dst_dir, dst_name) = linux_parent(self, &dest_vault_path)?;
+            let (dst_dir, dst_name) = linux_parent_mut(self, &dest_vault_path)?;
             renameat_with(
                 &src_dir,
                 src_name,
@@ -571,6 +570,52 @@ fn linux_parent<'a>(
     )
     .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
     Ok((fd, Path::new(name)))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_mut<'a>(
+    vault: &Vault,
+    path: &'a VaultPath,
+) -> Result<(std::os::unix::io::OwnedFd, &'a Path), CoreError> {
+    let mut dir = openat2(
+        &*vault.root_cap,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|e| io_at(vault.root(), io::Error::from_raw_os_error(e.raw_os_error())))?;
+    let mut components = path.as_path().components().peekable();
+    while let Some(component) = components.next() {
+        let name = component.as_os_str();
+        if components.peek().is_none() {
+            return Ok((dir, Path::new(name)));
+        }
+        match mkdirat(&dir, name, Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == 17 => {}
+            Err(e) => {
+                return Err(io_at(
+                    path.as_path(),
+                    io::Error::from_raw_os_error(e.raw_os_error()),
+                ))
+            }
+        }
+        dir = openat2(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )
+        .map_err(|e| {
+            io_at(
+                path.as_path(),
+                io::Error::from_raw_os_error(e.raw_os_error()),
+            )
+        })?;
+    }
+    Err(CoreError::InvalidPath(path.to_string()))
 }
 
 /// Supported Obsidian file categories.
