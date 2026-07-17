@@ -23,6 +23,8 @@ The application needs a graphical session (`DISPLAY` or Wayland) at runtime.
 ```sh
 cargo run -p tachylyte-app
 cargo fmt --check
+cargo doc --no-deps -p gpui
+cargo doc --no-deps -p tachylyte-app
 cargo check -p tachylyte-app --all-targets
 cargo test -p tachylyte-app
 cargo clippy -p tachylyte-app --all-targets -- -D warnings
