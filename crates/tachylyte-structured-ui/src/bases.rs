@@ -1,6 +1,7 @@
 use gpui::{div, prelude::*, px, rgb, Context, Render, SharedString, Window};
 use serde_json::Value;
-use tachylyte_structured::{filter_records, sort_records, BaseDocument, Direction, Record};
+use std::cmp::Ordering;
+use tachylyte_structured::{evaluate, BaseDocument, Direction, Record};
 
 /// Projection style for a Bases view.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,24 +68,26 @@ impl BaseModel {
     }
     /// Build a projection with stable columns and source indices.
     pub fn projection(&self) -> BaseProjection {
-        let mut rows: Vec<(usize, Record)> = self.records.iter().cloned().enumerate().collect();
+        // Keep source identity attached to the borrowed record for the whole
+        // pipeline. In particular, never recover an index by record equality:
+        // equal records are valid and must remain independently editable.
+        let mut rows: Vec<(usize, &Record)> = self.records.iter().enumerate().collect();
         if !self.filter.trim().is_empty() {
-            if let Ok(filtered) = filter_records(
-                &rows.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>(),
-                &self.filter,
-            ) {
-                rows.retain(|(_, r)| filtered.iter().any(|x| x == r));
-            } else {
-                rows.clear();
-            }
+            rows.retain(|(_, record)| {
+                evaluate(&self.filter, record)
+                    .map(|value| value_truthy(&value))
+                    .unwrap_or(false)
+            });
         }
         if let Some((property, direction)) = &self.sort {
-            let mut values: Vec<Record> = rows.iter().map(|(_, r)| r.clone()).collect();
-            sort_records(&mut values, property, direction.clone());
-            rows = values
-                .into_iter()
-                .map(|r| (self.records.iter().position(|x| x == &r).unwrap_or(0), r))
-                .collect();
+            rows.sort_by(|(_, left), (_, right)| {
+                let ordering = compare_values(left.get(property), right.get(property));
+                if matches!(direction, Direction::Desc) {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
         }
         let mut columns = self.document.properties.keys().cloned().collect::<Vec<_>>();
         for row in &rows {
@@ -156,6 +159,42 @@ impl BaseModel {
     }
 }
 
+fn value_truthy(value: &tachylyte_structured::Datum) -> bool {
+    match value {
+        tachylyte_structured::Datum::Null => false,
+        tachylyte_structured::Datum::Bool(value) => *value,
+        tachylyte_structured::Datum::Number(value) => *value != 0.,
+        tachylyte_structured::Datum::Text(value) => !value.is_empty(),
+    }
+}
+
+fn compare_values(left: Option<&Value>, right: Option<&Value>) -> Ordering {
+    fn rank(value: Option<&Value>) -> u8 {
+        match value.unwrap_or(&Value::Null) {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Number(_) => 2,
+            Value::String(_) => 3,
+            _ => 4,
+        }
+    }
+    let ordering = rank(left).cmp(&rank(right));
+    if ordering != Ordering::Equal {
+        return ordering;
+    }
+    match (left.unwrap_or(&Value::Null), right.unwrap_or(&Value::Null)) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Number(a), Value::Number(b)) => a
+            .as_f64()
+            .unwrap_or(0.)
+            .partial_cmp(&b.as_f64().unwrap_or(0.))
+            .unwrap_or(Ordering::Equal),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (a, b) => a.to_string().cmp(&b.to_string()),
+    }
+}
+
 /// Native GPUI renderer for table, card, and list projections.
 pub struct BasesView {
     pub model: BaseModel,
@@ -198,6 +237,11 @@ impl Render for BasesView {
             body = body.child(child);
         }
         let e = entity.clone();
+        let cards = entity.clone();
+        let list = entity.clone();
+        let sort = entity.clone();
+        let filter = entity.clone();
+        let disabled = self.model.disabled;
         div()
             .flex()
             .flex_col()
@@ -212,7 +256,11 @@ impl Render for BasesView {
                     .gap_2()
                     .px_2()
                     .bg(rgb(0x30343bff))
-                    .child("Bases")
+                    .child(if disabled {
+                        "Bases (disabled)"
+                    } else {
+                        "Bases"
+                    })
                     .child(div().id("bases-table").p_1().child("Table").on_mouse_down(
                         gpui::MouseButton::Left,
                         move |_, _, cx| {
@@ -222,7 +270,49 @@ impl Render for BasesView {
                             });
                         },
                     ))
-                    .child("Cards · List   |   Filter · Sort"),
+                    .child(div().id("bases-cards").p_1().child("Cards").on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_, _, cx| {
+                            cards.update(cx, |v, cx| {
+                                v.model.set_layout(BaseLayout::Cards);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(div().id("bases-list").p_1().child("List").on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_, _, cx| {
+                            list.update(cx, |v, cx| {
+                                v.model.set_layout(BaseLayout::List);
+                                cx.notify();
+                            });
+                        },
+                    ))
+                    .child(
+                        div()
+                            .id("bases-filter")
+                            .p_1()
+                            .child("Filter")
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                filter.update(cx, |v, cx| {
+                                    v.model.set_filter("");
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(div().id("bases-sort").p_1().child("Sort").on_mouse_down(
+                        gpui::MouseButton::Left,
+                        move |_, _, cx| {
+                            sort.update(cx, |v, cx| {
+                                if let Some(property) =
+                                    v.model.projection().columns.first().cloned()
+                                {
+                                    v.model.set_sort(property, Direction::Asc);
+                                }
+                                cx.notify();
+                            });
+                        },
+                    )),
             )
             .child(body)
     }
@@ -259,5 +349,37 @@ mod tests {
         m.select(Some(0));
         m.set_filter("true");
         assert!(m.take_commands().is_empty());
+    }
+
+    #[test]
+    fn equal_records_keep_distinct_source_indices_through_filter_and_sort() {
+        let mut first = Record::new();
+        first.insert("name".into(), Value::String("same".into()));
+        let second = first.clone();
+        let mut model = BaseModel::new(BaseDocument::default(), vec![first, second]);
+        model.set_filter("name = \"same\"");
+        model.set_sort("name", Direction::Asc);
+        let projection = model.projection();
+        assert_eq!(
+            projection
+                .rows
+                .iter()
+                .map(|row| row.source_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        model.edit_cell(
+            projection.rows[1].source_index,
+            "name",
+            Value::String("edited".into()),
+        );
+        assert_eq!(
+            model.take_commands().last(),
+            Some(&BaseCommand::Edit {
+                row: 1,
+                property: "name".into(),
+                value: Value::String("edited".into())
+            })
+        );
     }
 }
