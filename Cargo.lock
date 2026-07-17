@@ -5516,6 +5516,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-workflow-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "tachylyte-knowledge",
+ "tachylyte-workflows",
+]
+
+[[package]]
 name = "tachylyte-workflows"
 version = "0.1.0"
 dependencies = [
