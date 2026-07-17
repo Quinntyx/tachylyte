@@ -1,7 +1,10 @@
 #![deny(missing_docs)]
 //! A small, testable GPUI shell for a local Markdown vault.
 
-use gpui::{div, prelude::*, px, rgb, App, Application, Context, Render, Window, WindowOptions};
+use gpui::{
+    div, prelude::*, px, rgb, App, Application, Context, FocusHandle, KeyDownEvent, Render, Window,
+    WindowOptions,
+};
 use std::{env, path::Path};
 use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
@@ -218,6 +221,22 @@ impl AppController {
     }
     /// Select a Markdown file and parse it through tachylyte-markdown.
     pub fn select(&mut self, path: &VaultPath) -> bool {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| entry.kind == FileKind::Markdown && entry.path == *path)
+        {
+            self.status = format!("Not a scanned Markdown file: {path}");
+            return false;
+        }
+        if self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.editor.is_dirty())
+        {
+            self.status = "Unsaved changes: save before switching files".into();
+            return false;
+        }
         let Some(vault) = &self.vault else {
             self.status = "Open a vault first".into();
             return false;
@@ -301,10 +320,14 @@ impl AppController {
         let Some(d) = &mut self.document else {
             return false;
         };
-        match vault.write(&d.path, d.editor.source().as_bytes()) {
+        let path = d.path.clone();
+        let result = vault.write(&path, d.editor.source().as_bytes());
+        match result {
             Ok(()) => {
                 d.editor.mark_clean();
-                self.status = format!("Saved {}", d.path);
+                let _ = d;
+                self.rebuild_index();
+                self.status = format!("Saved {path}");
                 true
             }
             Err(e) => {
@@ -335,11 +358,66 @@ impl AppController {
             )
         })
     }
+    /// Return the detail/status sections currently projected by feature flags.
+    pub fn detail_projection(&self) -> Vec<&'static str> {
+        ["Outline", "Properties", "Links", "Word count"]
+            .into_iter()
+            .filter(|name| self.settings.feature_enabled(name))
+            .collect()
+    }
     /// Return matching Markdown paths using the knowledge query engine.
     pub fn search(&self) -> Vec<String> {
         tachylyte_knowledge::search(&self.index, &self.query)
             .map(|r| r.into_iter().map(|x| x.path).collect())
             .unwrap_or_default()
+    }
+    /// Move the source cursor one Unicode scalar left.
+    pub fn move_left(&mut self) {
+        if let Some(document) = &self.document {
+            self.cursor = document.editor.source()[..self.cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(offset, _)| offset);
+        }
+    }
+    /// Move the source cursor one Unicode scalar right.
+    pub fn move_right(&mut self) {
+        if let Some(document) = &self.document {
+            self.cursor = document.editor.source()[self.cursor..]
+                .chars()
+                .next()
+                .map_or(self.cursor, |character| self.cursor + character.len_utf8());
+        }
+    }
+    /// Execute a small, stable command-palette command.
+    pub fn execute_command(&mut self, command: &str) -> bool {
+        match command.trim().to_ascii_lowercase().as_str() {
+            "save" | "file.save" => self.save(),
+            "source" | "mode.source" => {
+                self.set_mode(ViewMode::Source);
+                true
+            }
+            "reading" | "mode.reading" => {
+                self.set_mode(ViewMode::Reading);
+                true
+            }
+            "toggle explorer" | "sidebar.left" => {
+                self.settings.toggle_left_sidebar();
+                true
+            }
+            "toggle details" | "sidebar.right" => {
+                self.settings.toggle_right_sidebar();
+                true
+            }
+            "toggle settings" => {
+                self.settings.toggle_feature("Properties");
+                true
+            }
+            _ => {
+                self.status = format!("Unknown command: {command}");
+                false
+            }
+        }
     }
 }
 
@@ -347,16 +425,19 @@ impl AppController {
 pub struct Shell {
     /// Application controller.
     pub controller: AppController,
+    /// Focus target for keyboard editing.
+    pub focus_handle: FocusHandle,
 }
-impl Default for Shell {
-    fn default() -> Self {
+impl Shell {
+    fn new(cx: &mut Context<Self>) -> Self {
         Self {
             controller: AppController::open_from_environment(),
+            focus_handle: cx.focus_handle(),
         }
     }
 }
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let light = self.controller.settings.theme == Theme::Light;
         let bg = if light { 0xf7f7f7ff } else { 0x1e1e1eff };
         let panel = if light { 0xffffffff } else { 0x252526ff };
@@ -379,7 +460,10 @@ impl Render for Shell {
             || "Select a Markdown file to begin.".into(),
             |d| d.editor.source().to_owned(),
         );
-        let entity = _cx.entity();
+        let entity = cx.entity();
+        let palette_entity = entity.clone();
+        let source_entity = entity.clone();
+        let reading_entity = entity.clone();
         let rows = entries.into_iter().map(|name| {
             let e = entity.clone();
             let path = name.clone();
@@ -413,21 +497,42 @@ impl Render for Shell {
         let right = if self.controller.settings.show_right_sidebar {
             let details = self.controller.details();
             let text = details.map_or_else(
-                || "No document\n\nOutline\nProperties\nLinks".into(),
-                |(o, p, l, w)| {
-                    format!(
-                        "OUTLINE\n{}\n\nProperties: {p}\nLinks: {l}\nWords: {w}",
-                        o.headings
-                            .iter()
-                            .map(|h| h.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    )
+                || "No document".into(),
+                |(outline, properties, links, words)| {
+                    let mut sections = Vec::new();
+                    if self.controller.settings.feature_enabled("Outline") {
+                        sections.push(format!(
+                            "OUTLINE\n{}",
+                            outline
+                                .headings
+                                .iter()
+                                .map(|heading| heading.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        ));
+                    }
+                    if self.controller.settings.feature_enabled("Properties") {
+                        sections.push(format!("Properties: {properties}"));
+                    }
+                    if self.controller.settings.feature_enabled("Links") {
+                        sections.push(format!("Links: {links}"));
+                    }
+                    if self.controller.settings.feature_enabled("Word count") {
+                        sections.push(format!("Words: {words}"));
+                    }
+                    sections.join("\n\n")
                 },
             );
             div().w(px(230.)).bg(rgb(panel)).p_3().child(text)
         } else {
             div().w(px(0.))
+        };
+        let search_results = if self.controller.settings.feature_enabled("Search")
+            && !self.controller.query.is_empty()
+        {
+            self.controller.search().join("\n")
+        } else {
+            String::new()
         };
         let palette = if self.controller.palette_open
             && self.controller.settings.feature_enabled("Command palette")
@@ -442,8 +547,8 @@ impl Render for Shell {
                 .border_1()
                 .border_color(rgb(0x808080ff))
                 .child(format!(
-                    "COMMAND PALETTE\n{}\nCtrl/Cmd+S Save · Source · Reading",
-                    self.controller.query
+                    "COMMAND PALETTE\n{}\n{}\nCtrl/Cmd+S Save · Enter execute",
+                    self.controller.query, search_results
                 ))
         } else {
             div()
@@ -474,7 +579,19 @@ impl Render for Shell {
                         } else {
                             ""
                         }
-                    )),
+                    ))
+                    .child(
+                        div()
+                            .id("palette-button")
+                            .p_2()
+                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                palette_entity.update(cx, |shell, cx| {
+                                    shell.controller.toggle_palette();
+                                    cx.notify();
+                                });
+                            })
+                            .child("⌘P Palette"),
+                    ),
             )
             .child(
                 div()
@@ -491,8 +608,37 @@ impl Render for Shell {
                                 div()
                                     .flex()
                                     .gap_2()
-                                    .child("SOURCE")
-                                    .child("  LIVE PREVIEW  READING"),
+                                    .child(
+                                        div()
+                                            .id("source-mode")
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_, _, cx| {
+                                                    source_entity.update(cx, |shell, cx| {
+                                                        shell.controller.set_mode(ViewMode::Source);
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            )
+                                            .child("SOURCE"),
+                                    )
+                                    .child("  LIVE PREVIEW  ")
+                                    .child(
+                                        div()
+                                            .id("reading-mode")
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                move |_, _, cx| {
+                                                    reading_entity.update(cx, |shell, cx| {
+                                                        shell
+                                                            .controller
+                                                            .set_mode(ViewMode::Reading);
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            )
+                                            .child("READING"),
+                                    ),
                             )
                             .child(
                                 div()
@@ -500,6 +646,86 @@ impl Render for Shell {
                                     .p_3()
                                     .border_1()
                                     .border_color(rgb(0x3b3b3bff))
+                                    .track_focus(&self.focus_handle)
+                                    .on_key_down(cx.listener(
+                                        |shell, event: &KeyDownEvent, window, cx| {
+                                            let key = event.keystroke.key.as_str();
+                                            let modified = event.keystroke.modifiers.control
+                                                || event.keystroke.modifiers.platform;
+                                            if shell.controller.palette_open {
+                                                match key {
+                                                    "enter" => {
+                                                        let command =
+                                                            shell.controller.query.clone();
+                                                        shell.controller.execute_command(&command);
+                                                        shell.controller.palette_open = false;
+                                                    }
+                                                    "backspace" => {
+                                                        shell.controller.query.pop();
+                                                    }
+                                                    "escape" => {
+                                                        shell.controller.palette_open = false
+                                                    }
+                                                    _ if event.keystroke.key_char.is_some()
+                                                        && !modified =>
+                                                    {
+                                                        shell.controller.query.push_str(
+                                                            event
+                                                                .keystroke
+                                                                .key_char
+                                                                .as_deref()
+                                                                .unwrap_or_default(),
+                                                        )
+                                                    }
+                                                    _ => {}
+                                                }
+                                            } else if modified && key.eq_ignore_ascii_case("s") {
+                                                shell.controller.save();
+                                            } else if modified && key.eq_ignore_ascii_case("p") {
+                                                shell.controller.toggle_palette();
+                                            } else {
+                                                match key {
+                                                    "backspace" => {
+                                                        shell.controller.backspace();
+                                                    }
+                                                    "enter" => {
+                                                        shell.controller.newline();
+                                                    }
+                                                    "arrowleft" | "left" => {
+                                                        shell.controller.move_left()
+                                                    }
+                                                    "arrowright" | "right" => {
+                                                        shell.controller.move_right()
+                                                    }
+                                                    "escape" => {
+                                                        shell.controller.set_mode(ViewMode::Reading)
+                                                    }
+                                                    _ if event.keystroke.key_char.is_some()
+                                                        && !modified =>
+                                                    {
+                                                        shell.controller.insert_text(
+                                                            event
+                                                                .keystroke
+                                                                .key_char
+                                                                .as_deref()
+                                                                .unwrap_or_default(),
+                                                        );
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            cx.notify();
+                                            if modified && key.eq_ignore_ascii_case("s") {
+                                                window.prevent_default();
+                                            }
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|shell, _, window, _| {
+                                            window.focus(&shell.focus_handle);
+                                        }),
+                                    )
                                     .child(source),
                             )
                             .child(div().h(px(28.)).child(status)),
@@ -519,10 +745,8 @@ impl Render for Shell {
 
 /// Open the desktop window.
 pub fn open_shell_window(cx: &mut App) -> gpui::Result<()> {
-    cx.open_window(WindowOptions::default(), |_window, cx| {
-        cx.new(|_| Shell::default())
-    })
-    .map(|_| ())
+    cx.open_window(WindowOptions::default(), |_window, cx| cx.new(Shell::new))
+        .map(|_| ())
 }
 /// Start the native GPUI application.
 pub fn launch() {
@@ -577,5 +801,45 @@ mod tests {
         assert!(!c.settings.toggle_feature("unknown"));
         c.toggle_palette();
         assert!(c.palette_open);
+    }
+    #[test]
+    fn dirty_switch_is_explicitly_blocked() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("a.md"), "a").unwrap();
+        fs::write(d.path().join("b.md"), "b").unwrap();
+        let mut c = AppController::new();
+        assert!(c.open_vault(d.path()));
+        assert!(c.select(&VaultPath::new("a.md").unwrap()));
+        assert!(c.insert_text("changed"));
+        assert!(!c.select(&VaultPath::new("b.md").unwrap()));
+        assert!(c.status.contains("Unsaved"));
+    }
+    #[test]
+    fn save_reindexes_changed_content_and_rejects_unscanned_files() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("note.md"), "old").unwrap();
+        fs::write(d.path().join("data.txt"), "old").unwrap();
+        let mut c = AppController::new();
+        assert!(c.open_vault(d.path()));
+        assert!(!c.select(&VaultPath::new("data.txt").unwrap()));
+        assert!(c.select(&VaultPath::new("note.md").unwrap()));
+        c.set_cursor(0);
+        assert!(c.insert_text("new "));
+        c.query = "new".into();
+        assert!(c.search().is_empty());
+        assert!(c.save());
+        assert_eq!(c.search(), vec!["note.md"]);
+    }
+    #[test]
+    fn palette_commands_and_feature_projection_are_deterministic() {
+        let mut c = AppController::new();
+        assert!(c.execute_command("sidebar.left"));
+        assert!(!c.settings.show_left_sidebar);
+        assert!(c.execute_command("mode.reading"));
+        assert!(c.settings.toggle_feature("Links"));
+        assert!(!c.detail_projection().contains(&"Links"));
+        assert!(c.detail_projection().contains(&"Outline"));
+        assert!(!c.execute_command("not-a-command"));
+        assert!(c.status.contains("Unknown"));
     }
 }
