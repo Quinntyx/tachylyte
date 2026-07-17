@@ -78,7 +78,8 @@ impl<T: AsRef<str>> RowListState<T> {
                         .selected
                         .and_then(|i| indices.iter().position(|&x| x == i))
                     {
-                        Some(0) | None => indices[0],
+                        Some(0) => indices[0],
+                        None => indices[indices.len() - 1],
                         Some(p) => indices[p - 1],
                     },
                 )
@@ -90,14 +91,18 @@ impl<T: AsRef<str>> RowListState<T> {
                         .and_then(|i| indices.iter().position(|&x| x == i))
                     {
                         Some(p) if p + 1 < indices.len() => indices[p + 1],
-                        _ => indices[indices.len() - 1],
+                        Some(_) => indices[indices.len() - 1],
+                        None => indices[0],
                     },
                 )
             }
             ListKey::Home => self.selected = Some(indices[0]),
             ListKey::End => self.selected = Some(indices[indices.len() - 1]),
             ListKey::Enter => {
-                let index = self.selected.unwrap_or(indices[0]);
+                let index = self
+                    .selected
+                    .filter(|selected| indices.contains(selected))
+                    .unwrap_or(indices[0]);
                 self.selected = Some(index);
                 return self.rows.get(index);
             }
