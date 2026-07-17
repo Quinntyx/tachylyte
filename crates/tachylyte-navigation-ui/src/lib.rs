@@ -4,6 +4,20 @@
 //! snapshots from `tachylyte-core`/`tachylyte-knowledge`, reduce actions, and subscribe to
 //! the small event vocabulary below.
 
+/// Intent vocabulary for the file explorer.
+pub mod explorer_intents;
+/// Data model and row projection for the file explorer.
+pub mod explorer_model;
+/// GPUI view for the file explorer.
+pub mod explorer_view;
+
+pub use explorer_intents::{ExplorerAction, ExplorerIntent, ExplorerSortMode};
+pub use explorer_model::{
+    ExplorerFileInput, ExplorerModel, ExplorerNode, ExplorerNodeKind, ExplorerRow,
+    FileExplorerTreeModel, FileKind, SortMode, VisibleExplorerRow,
+};
+pub use explorer_view::FileExplorerView;
+
 use gpui::{div, prelude::*, px, rgb, Context, Entity, Render, Window};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
