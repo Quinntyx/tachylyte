@@ -4,7 +4,10 @@
 //! temporary-file-and-rename strategy where applicable.
 
 #[cfg(target_os = "linux")]
-use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::{
+    fsync, openat, openat2, renameat, renameat_with, unlinkat, AtFlags, Mode, OFlags, RenameFlags,
+    ResolveFlags,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 #[cfg(target_os = "linux")]
@@ -185,6 +188,38 @@ impl Vault {
     }
     /// Atomically replace a file, refusing symlink targets and creating parents.
     pub fn write(&self, path: &VaultPath, data: &[u8]) -> Result<(), CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let p = self.checked(path, true)?;
+            let parent = p.parent().unwrap();
+            fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+            let (dir, name) = linux_parent(self, path)?;
+            let tmp = format!(".tachylyte-{}.tmp", unique_suffix());
+            let fd = openat(
+                &dir,
+                &tmp,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            let mut file: fs::File = fd.into();
+            use std::io::Write;
+            file.write_all(data)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| io_at(parent, e))?;
+            renameat(&dir, &tmp, &dir, name)
+                .map_err(|e| io_at(&p, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            fsync(&dir)
+                .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
+        }
+        #[allow(unreachable_code)]
         let p = self.checked(path, true)?;
         let parent = p.parent().unwrap();
         fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
@@ -209,6 +244,43 @@ impl Vault {
     }
     /// Atomically create a new file, failing if it already exists.
     pub fn create(&self, path: &VaultPath, data: &[u8]) -> Result<(), CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let p = self.checked(path, true)?;
+            let parent = p.parent().unwrap();
+            fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+            let (dir, name) = linux_parent(self, path)?;
+            let tmp = format!(".tachylyte-{}.tmp", unique_suffix());
+            let fd = openat(
+                &dir,
+                &tmp,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                Mode::from_raw_mode(0o600),
+            )
+            .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            let mut file: fs::File = fd.into();
+            use std::io::Write;
+            file.write_all(data)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| io_at(parent, e))?;
+            renameat_with(&dir, &tmp, &dir, name, RenameFlags::NOREPLACE).map_err(|e| {
+                if e.raw_os_error() == 17 {
+                    CoreError::Duplicate(path.0.clone())
+                } else {
+                    io_at(&p, io::Error::from_raw_os_error(e.raw_os_error()))
+                }
+            })?;
+            fsync(&dir)
+                .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
+        }
+        #[allow(unreachable_code)]
         let p = self.checked(path, true)?;
         let parent = p.parent().unwrap();
         fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
@@ -240,6 +312,42 @@ impl Vault {
     }
     /// Rename a file or directory within this vault.
     pub fn rename(&self, from: &VaultPath, to: &VaultPath) -> Result<(), CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let a = self.checked(from, false)?;
+            let b = self.checked(to, true)?;
+            if let Some(parent) = b.parent() {
+                fs::create_dir_all(parent).map_err(|e| io_at(parent, e))?;
+            }
+            let (src_dir, src_name) = linux_parent(self, from)?;
+            let (dst_dir, dst_name) = linux_parent(self, to)?;
+            renameat_with(
+                &src_dir,
+                src_name,
+                &dst_dir,
+                dst_name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|e| {
+                if e.raw_os_error() == 17 {
+                    CoreError::Duplicate(to.0.clone())
+                } else {
+                    io_at(&b, io::Error::from_raw_os_error(e.raw_os_error()))
+                }
+            })?;
+            fsync(&src_dir)
+                .map_err(|e| io_at(&a, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            fsync(&dst_dir)
+                .map_err(|e| io_at(&b, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
+        }
+        #[allow(unreachable_code)]
         let a = self.checked(from, false)?;
         let b = self.checked(to, true)?;
         if b.exists() {
@@ -271,6 +379,23 @@ impl Vault {
     }
     /// Delete a vault entry permanently.
     pub fn delete(&self, path: &VaultPath) -> Result<(), CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let p = self.checked(path, false)?;
+            let (dir, name) = linux_parent(self, path)?;
+            let result = unlinkat(&dir, name, AtFlags::empty())
+                .or_else(|_| unlinkat(&dir, name, AtFlags::REMOVEDIR));
+            result.map_err(|e| io_at(&p, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            fsync(&dir).map_err(|e| io_at(&p, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
+        }
+        #[allow(unreachable_code)]
         let p = self.checked(path, false)?;
         let m = fs::metadata(&p).map_err(|e| io_at(&p, e))?;
         if m.is_dir() {
@@ -286,6 +411,53 @@ impl Vault {
     }
     /// Move an entry atomically into `.trash`, preserving its filename.
     pub fn trash(&self, path: &VaultPath) -> Result<VaultPath, CoreError> {
+        #[cfg(target_os = "linux")]
+        {
+            let from = self.checked(path, false)?;
+            let dir_path = self.root.join(".trash");
+            match fs::symlink_metadata(&dir_path) {
+                Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+                Ok(m) if m.file_type().is_symlink() => return Err(CoreError::Symlink(dir_path)),
+                Ok(_) => return Err(CoreError::InvalidPath(".trash is not a directory".into())),
+                Err(e) => fs::create_dir(&dir_path)
+                    .map_err(|x| io_at(&dir_path, x))
+                    .or(Err(io_at(&dir_path, e)))?,
+            }
+            let name = path
+                .as_path()
+                .file_name()
+                .ok_or_else(|| CoreError::InvalidPath(path.to_string()))?;
+            let dest_path = PathBuf::from(".trash").join(name);
+            let dest_vault_path = VaultPath::new(&dest_path).unwrap();
+            let (src_dir, src_name) = linux_parent(self, path)?;
+            let (dst_dir, dst_name) = linux_parent(self, &dest_vault_path)?;
+            renameat_with(
+                &src_dir,
+                src_name,
+                &dst_dir,
+                dst_name,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|e| {
+                if e.raw_os_error() == 17 {
+                    CoreError::Duplicate(dest_path.clone())
+                } else {
+                    io_at(&from, io::Error::from_raw_os_error(e.raw_os_error()))
+                }
+            })?;
+            fsync(&src_dir)
+                .map_err(|e| io_at(&from, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            fsync(&dst_dir)
+                .map_err(|e| io_at(&dir_path, io::Error::from_raw_os_error(e.raw_os_error())))?;
+            return Ok(VaultPath::new(dest_path).unwrap());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CoreError::Unsupported(
+                "secure mutations require Linux openat2 in this build".into(),
+            ));
+        }
+        #[allow(unreachable_code)]
         let from = self.checked(path, false)?;
         let dir = self.root.join(".trash");
         match fs::symlink_metadata(&dir) {
@@ -374,6 +546,31 @@ fn sync_parent(parent: &Path) {
     if let Ok(file) = fs::File::open(parent) {
         let _ = file.sync_all();
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent<'a>(
+    vault: &Vault,
+    path: &'a VaultPath,
+) -> Result<(std::os::unix::io::OwnedFd, &'a Path), CoreError> {
+    let parent = path
+        .as_path()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .as_path()
+        .file_name()
+        .ok_or_else(|| CoreError::InvalidPath(path.to_string()))?;
+    let fd = openat2(
+        &*vault.root_cap,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|e| io_at(parent, io::Error::from_raw_os_error(e.raw_os_error())))?;
+    Ok((fd, Path::new(name)))
 }
 
 /// Supported Obsidian file categories.
