@@ -5337,6 +5337,10 @@ name = "tachylyte-app"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "tachylyte-core",
+ "tachylyte-knowledge",
+ "tachylyte-markdown",
+ "tempfile",
 ]
 
 [[package]]
