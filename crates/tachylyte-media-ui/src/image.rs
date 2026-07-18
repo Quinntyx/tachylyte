@@ -1,4 +1,5 @@
-use gpui::{div, prelude::*, Context, IntoElement, Render, Window};
+use gpui::{div, img, prelude::*, Context, IntoElement, Render, Window};
+use std::path::{Path, PathBuf};
 
 use crate::{MediaIntent, MediaTokens};
 
@@ -63,6 +64,23 @@ impl ImageModel {
     pub fn take_intents(&mut self) -> Vec<MediaIntent> {
         std::mem::take(&mut self.intents)
     }
+
+    /// Resolve only local, existing files. Keeping this check separate from the
+    /// view means an image source can never accidentally become a network URL.
+    pub fn local_path(&self) -> Result<PathBuf, String> {
+        local_image_path(&self.source)
+    }
+}
+
+fn local_image_path(source: &str) -> Result<PathBuf, String> {
+    if source.trim().is_empty() || source.chars().any(char::is_control) || source.contains("://") {
+        return Err("image source must be a local file path".into());
+    }
+    let path = Path::new(source);
+    if !path.is_file() {
+        return Err(format!("image file not found: {source}"));
+    }
+    Ok(path.to_path_buf())
 }
 
 pub struct ImageView {
@@ -76,6 +94,13 @@ impl ImageView {
 
 impl Render for ImageView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let preview = match self.model.local_path() {
+            Ok(path) => img(path).size_full().into_any_element(),
+            Err(error) => div()
+                .text_sm()
+                .child(format!("[image preview unavailable] {error}"))
+                .into_any_element(),
+        };
         div()
             .size_full()
             .bg(self.model.tokens.background)
@@ -89,8 +114,9 @@ impl Render for ImageView {
                     .text_lg()
                     .child(format!("Image: {}", self.model.title)),
             )
+            .child(preview)
             .child(div().mt_2().text_sm().child(format!(
-                "[image preview unavailable] · {}% · {:?}",
+                "{}% · {:?}",
                 (self.model.zoom * 100.0) as u32,
                 self.model.fit
             )))
@@ -115,5 +141,18 @@ mod tests {
         m.open_external();
         assert_eq!(m.fit, ImageFit::Cover);
         assert_eq!(m.take_intents().len(), 1);
+    }
+
+    #[test]
+    fn local_path_rejects_urls_and_missing_files() {
+        assert!(local_image_path("https://example.test/image.png").is_err());
+        assert!(local_image_path("/definitely/not/an/image.png").is_err());
+    }
+
+    #[test]
+    fn local_path_accepts_existing_file_for_gpui_decoder() {
+        let path = local_image_path(&(env!("CARGO_MANIFEST_DIR").to_owned() + "/Cargo.toml"))
+            .expect("manifest is a local file");
+        assert!(path.is_file());
     }
 }
