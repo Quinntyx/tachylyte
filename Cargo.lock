@@ -5385,6 +5385,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tachylyte-account-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde",
+ "tachylyte-services",
+]
+
+[[package]]
 name = "tachylyte-app"
 version = "0.1.0"
 dependencies = [
