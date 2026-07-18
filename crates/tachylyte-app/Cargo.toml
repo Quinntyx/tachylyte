@@ -18,6 +18,9 @@ tachylyte-settings-ui.workspace = true
 tachylyte-graph-ui.workspace = true
 tachylyte-editor-ui.workspace = true
 tachylyte-workflow-ui.workspace = true
+tachylyte-launcher-model.workspace = true
+tachylyte-navigation-ui.workspace = true
+tachylyte-workspace.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
