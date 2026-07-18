@@ -17,6 +17,10 @@ pub struct PlaybackModel {
     pub playing: bool,
     pub position_ms: u64,
     pub duration_ms: u64,
+    /// Output volume in the inclusive range 0.0..=1.0.
+    pub volume: f32,
+    /// Playback rate, mirrored to the host through [`MediaIntent::SetSpeed`].
+    pub speed: f32,
     intents: IntentQueue,
 }
 
@@ -31,6 +35,8 @@ impl PlaybackModel {
             playing: false,
             position_ms: 0,
             duration_ms: 0,
+            volume: 1.0,
+            speed: 1.0,
             intents: IntentQueue::default(),
         }
     }
@@ -46,6 +52,26 @@ impl PlaybackModel {
     pub fn seek(&mut self, milliseconds: u64) {
         self.position_ms = milliseconds.min(self.duration_ms);
         self.intents.push(MediaIntent::Seek(self.position_ms));
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = if volume.is_nan() {
+            0.0
+        } else {
+            volume.clamp(0.0, 1.0)
+        };
+        self.intents
+            .push(MediaIntent::SetVolume((self.volume * 100.0).round() as u8));
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = if speed.is_nan() {
+            1.0
+        } else {
+            speed.clamp(0.25, 4.0)
+        };
+        self.intents
+            .push(MediaIntent::SetSpeed((self.speed * 100.0).round() as u16));
     }
     pub fn take_intents(&mut self) -> Vec<MediaIntent> {
         std::iter::from_fn(|| self.intents.take()).collect()
@@ -94,11 +120,20 @@ impl Render for PlaybackView {
                         },
                     ))),
             )
+            .child(div().text_sm().child(format!(
+                "Timeline: {} / {} ms",
+                self.model.position_ms, self.model.duration_ms
+            )))
             .child(div().text_sm().child(if self.model.playing {
                 "Playing · Pause"
             } else {
                 "Paused · Play"
             }))
+            .child(div().text_sm().child(format!(
+                "Volume: {:.0}% · Speed: {:.2}×",
+                self.model.volume * 100.0,
+                self.model.speed
+            )))
     }
 }
 
@@ -122,5 +157,36 @@ mod tests {
         m.seek(99);
         assert_eq!(m.position_ms, 10);
         assert_eq!(m.take_intents(), vec![MediaIntent::Seek(10)]);
+    }
+
+    #[test]
+    fn volume_and_speed_clamp_and_emit_intents() {
+        let mut m = PlaybackModel::new("a", "x", PlaybackKind::Audio);
+        m.set_volume(2.0);
+        assert_eq!(m.volume, 1.0);
+        m.set_volume(-1.0);
+        assert_eq!(m.volume, 0.0);
+        m.set_speed(9.0);
+        assert_eq!(m.speed, 4.0);
+        m.set_speed(0.0);
+        assert_eq!(m.speed, 0.25);
+        assert_eq!(
+            m.take_intents(),
+            vec![
+                MediaIntent::SetVolume(100),
+                MediaIntent::SetVolume(0),
+                MediaIntent::SetSpeed(400),
+                MediaIntent::SetSpeed(25)
+            ]
+        );
+    }
+
+    #[test]
+    fn non_finite_controls_are_safe() {
+        let mut m = PlaybackModel::new("a", "x", PlaybackKind::Audio);
+        m.set_volume(f32::NAN);
+        m.set_speed(f32::NAN);
+        assert_eq!(m.volume, 0.0);
+        assert_eq!(m.speed, 1.0);
     }
 }
