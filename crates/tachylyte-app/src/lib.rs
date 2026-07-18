@@ -1989,7 +1989,7 @@ impl Render for Shell {
                 },
             ));
 
-        let explorer_entity = self.explorer.as_ref().map(|e| e.clone());
+        let explorer_entity = self.explorer.clone();
         let explorer = if self.controller.settings.show_left_sidebar
             && self.controller.settings.feature_enabled("File explorer")
         {
