@@ -5397,10 +5397,13 @@ dependencies = [
  "tachylyte-editor-ui",
  "tachylyte-graph-ui",
  "tachylyte-knowledge",
+ "tachylyte-launcher-model",
  "tachylyte-markdown",
+ "tachylyte-navigation-ui",
  "tachylyte-settings-ui",
  "tachylyte-theme",
  "tachylyte-workflow-ui",
+ "tachylyte-workspace",
  "tempfile",
 ]
 
