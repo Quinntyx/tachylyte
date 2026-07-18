@@ -1,0 +1,10 @@
+[package]
+name = "tachylyte-account-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+serde.workspace = true
+tachylyte-services = { path = "../tachylyte-services" }

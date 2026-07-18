@@ -24,3 +24,7 @@ tachylyte-media-ui = { path = "crates/tachylyte-media-ui" }
 tachylyte-settings-ui = { path = "crates/tachylyte-settings-ui" }
 tachylyte-graph-ui = { path = "crates/tachylyte-graph-ui" }
 tachylyte-editor-ui = { path = "crates/tachylyte-editor-ui" }
+tachylyte-account-ui = { path = "crates/tachylyte-account-ui" }
+tachylyte-launcher-model = { path = "crates/tachylyte-launcher-model" }
+tachylyte-navigation-ui = { path = "crates/tachylyte-navigation-ui" }
+tachylyte-workspace = { path = "crates/tachylyte-workspace" }

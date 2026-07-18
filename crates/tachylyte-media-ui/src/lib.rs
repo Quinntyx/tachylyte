@@ -13,6 +13,10 @@ pub enum MediaIntent {
     Pause,
     /// Seek to a position, expressed in milliseconds.
     Seek(u64),
+    /// Set output volume as a percentage from 0 through 100.
+    SetVolume(u8),
+    /// Set playback speed in hundredths (100 means 1.00x).
+    SetSpeed(u16),
     /// Advance to the next page or slide.
     NextPage,
     /// Return to the previous page or slide.
@@ -76,6 +80,7 @@ impl MediaTokens {
 }
 
 pub mod attachment;
+pub mod document;
 pub mod image;
 pub mod pdf;
 pub mod playback;
@@ -83,11 +88,12 @@ pub mod slides;
 pub mod web;
 
 pub use attachment::{AttachmentInfo, AttachmentModel, AttachmentView};
+pub use document::{file_kind, route_file, DocumentView, FileKind};
 pub use image::{ImageFit, ImageMetadata, ImageModel, ImageView};
-pub use pdf::{PdfBackendState, PdfModel, PdfView};
+pub use pdf::{PdfBackendState, PdfIntent, PdfModel, PdfThumbnail, PdfView};
 pub use playback::{AudioView, PlaybackKind, PlaybackModel, PlaybackView, VideoView};
 pub use slides::{SlidesModel, SlidesView};
-pub use web::{WebPolicy, WebView, WebViewModel};
+pub use web::{WebIntent, WebPolicy, WebView, WebViewModel};
 
 #[cfg(test)]
 mod tests {

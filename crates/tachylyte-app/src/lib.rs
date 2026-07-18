@@ -13,7 +13,10 @@ use std::{
 };
 use tachylyte_core::{FileKind, Vault, VaultEntry, VaultPath};
 use tachylyte_knowledge::{Document as KnowledgeDocument, VaultIndex};
+use tachylyte_launcher_model::LauncherModel;
 use tachylyte_markdown::{EditorDocument, ViewMode};
+use tachylyte_navigation_ui::{ExplorerIntent, ExplorerModel, FileExplorerView};
+use tachylyte_workspace::{Orientation, Workspace};
 
 mod editor_surface;
 mod graph_view;
@@ -669,12 +672,14 @@ fn load_recent() -> Vec<RecentVault> {
     load_config().recent
 }
 
+#[allow(dead_code)] // Legacy JSON migration support; LauncherModel owns new writes.
 fn save_recent(recent: &[RecentVault]) {
     let mut config = load_config();
     config.recent = recent.to_vec();
     save_config(&config);
 }
 
+#[allow(dead_code)] // Legacy JSON migration support; LauncherModel owns new writes.
 fn remember_vault(path: &Path, recent: &mut Vec<RecentVault>) {
     recent.retain(|v| v.path != path);
     recent.insert(
@@ -694,7 +699,7 @@ fn remember_vault(path: &Path, recent: &mut Vec<RecentVault>) {
 
 /// Compact vault chooser shown when startup has no usable vault.
 pub struct Launcher {
-    recent: Vec<RecentVault>,
+    model: Option<LauncherModel>,
     name_input: String,
     path_input: String,
     editing_name: bool,
@@ -704,8 +709,18 @@ pub struct Launcher {
 
 impl Launcher {
     fn new(cx: &mut Context<Self>) -> Self {
+        let mut model = LauncherModel::open_default().ok();
+        // Migrate the pre-registry recent list once.  The model owns all
+        // subsequent recent/open/create persistence.
+        if let Some(model) = &mut model {
+            if model.recent().is_empty() {
+                for recent in load_recent() {
+                    let _ = model.import(&recent.path);
+                }
+            }
+        }
         Self {
-            recent: load_recent(),
+            model,
             name_input: String::new(),
             path_input: String::new(),
             editing_name: false,
@@ -715,9 +730,24 @@ impl Launcher {
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = if let Some(model) = &mut self.model {
+            match model.import(&path) {
+                Ok(entry) => {
+                    let path = entry.path_buf();
+                    let _ = model.select(entry.id.clone());
+                    path
+                }
+                Err(error) => {
+                    self.message = format!("Could not register vault: {error}");
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            path
+        };
         let mut controller = AppController::new();
         if controller.open_vault(&path) {
-            remember_vault(&path, &mut self.recent);
             // `open_window` creates the workspace before returning, so only
             // remove the launcher after that operation succeeds.  This keeps
             // a failed open visible and avoids leaving two application
@@ -744,11 +774,18 @@ impl Launcher {
             cx.notify();
             return;
         }
-        let path = Path::new(parent).join(name);
-        match fs::create_dir_all(&path) {
-            Ok(()) => self.open_path(path, window, cx),
-            Err(e) => {
-                self.message = format!("Could not create vault: {e}");
+        let Some(model) = &mut self.model else {
+            self.message = "Vault registry unavailable".into();
+            cx.notify();
+            return;
+        };
+        match model
+            .create_plan(name, PathBuf::from(parent))
+            .and_then(|plan| model.execute_create(&plan))
+        {
+            Ok(entry) => self.open_path(entry.path_buf(), window, cx),
+            Err(error) => {
+                self.message = format!("Could not create vault: {error}");
                 cx.notify();
             }
         }
@@ -758,12 +795,21 @@ impl Launcher {
 impl Render for Launcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
-        let recent = self.recent.clone();
-        let cards = recent.into_iter().enumerate().map(|(i, vault)| {
+        let recent = self
+            .model
+            .as_ref()
+            .map(|model| {
+                model
+                    .recent()
+                    .into_iter()
+                    .map(|entry| (entry.id.clone(), entry.name.clone(), entry.path_buf()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let cards = recent.into_iter().enumerate().map(|(i, (id, name, path))| {
             let open_entity = entity.clone();
             let remove_entity = entity.clone();
-            let path = vault.path.clone();
-            let remove_path = path.clone();
+            let remove_id = id.clone();
             let reveal_path = path.clone();
             let stale = !path.is_dir();
             div()
@@ -775,7 +821,7 @@ impl Render for Launcher {
                 .border_color(rgb(0xe0e0e0))
                 .child(div().flex_1().child(format!(
                     "{}\n{}{}",
-                    vault.name,
+                    name,
                     path.display(),
                     if stale { "  · unavailable" } else { "" }
                 )))
@@ -808,8 +854,9 @@ impl Render for Launcher {
                         .py_1()
                         .on_mouse_down(gpui::MouseButton::Left, move |_, _, c| {
                             remove_entity.update(c, |l, c| {
-                                l.recent.retain(|v| v.path != remove_path);
-                                save_recent(&l.recent);
+                                if let Some(model) = &mut l.model {
+                                    let _ = model.remove(&remove_id);
+                                }
                                 c.notify();
                             })
                         })
@@ -1018,30 +1065,63 @@ pub struct Shell {
     pub controller: AppController,
     /// Focus target for keyboard editing.
     pub focus_handle: FocusHandle,
+    /// Render-neutral workspace layout and tab/history state.
+    pub workspace: Workspace,
+    /// Shared launcher registry/settings facade.
+    launcher_model: Option<LauncherModel>,
     graph: Option<GraphMount>,
     editor: Option<EditorSurface>,
     settings_surface: Option<SettingsSurface>,
     command_palette: Option<CommandPaletteSurface>,
     quick_switcher: Option<QuickSwitcherSurface>,
+    explorer: Option<gpui::Entity<FileExplorerView>>,
     settings_open: bool,
     quick_switcher_open: bool,
 }
 impl Shell {
-    fn with_controller(controller: AppController, cx: &mut Context<Self>) -> Self {
+    fn with_controller(mut controller: AppController, cx: &mut Context<Self>) -> Self {
+        let launcher_model = LauncherModel::open_default().ok();
+        if let Some(model) = &launcher_model {
+            if model.settings().appearance.theme.as_deref() == Some("dark") {
+                controller.settings.theme = Theme::Dark;
+            }
+        }
+        let mut workspace = Workspace::default();
+        if let Some(path) = controller.selected_path.as_ref() {
+            workspace.open_reusable_path(path.to_string());
+        }
         Self {
             controller,
             focus_handle: cx.focus_handle(),
+            workspace,
+            launcher_model,
             graph: None,
             editor: None,
             settings_surface: None,
             command_palette: None,
             quick_switcher: None,
+            explorer: None,
             settings_open: false,
             quick_switcher_open: false,
         }
     }
 
     fn ensure_surfaces(&mut self, cx: &mut Context<Self>) {
+        let paths = self
+            .controller
+            .entries
+            .iter()
+            .map(|entry| entry.path.to_string())
+            .collect::<Vec<_>>();
+        if let Some(explorer) = &self.explorer {
+            explorer.update(cx, |view, cx| {
+                view.model_mut().update_paths(paths.clone());
+                cx.notify();
+            });
+        } else {
+            self.explorer =
+                Some(cx.new(|_| FileExplorerView::new(ExplorerModel::from_paths(paths))));
+        }
         if self.graph.is_none() {
             self.graph = Some(GraphMount::mount(&self.controller.index, cx));
         } else if let Some(graph) = &self.graph {
@@ -1091,6 +1171,113 @@ impl Shell {
         }
     }
 
+    fn apply_explorer_intents(&mut self, cx: &mut Context<Self>) {
+        let Some(explorer) = self.explorer.clone() else {
+            return;
+        };
+        let intents = explorer.update(cx, |view, _| view.take_intents());
+        for intent in intents {
+            match intent {
+                ExplorerIntent::Select { path } | ExplorerIntent::Open { path } => {
+                    if let Ok(path) = VaultPath::new(path) {
+                        self.open_path_in_workspace(&path);
+                    }
+                }
+                ExplorerIntent::Activate => {
+                    if let Some(path) = explorer
+                        .read(cx)
+                        .model()
+                        .active_path()
+                        .and_then(|p| VaultPath::new(p).ok())
+                    {
+                        self.open_path_in_workspace(&path);
+                    }
+                }
+                ExplorerIntent::NewNote { .. } => {
+                    if self.controller.create_note() {
+                        self.sync_workspace_to_controller();
+                    }
+                }
+                ExplorerIntent::NewFolder { .. } => {
+                    self.controller.create_folder();
+                }
+                ExplorerIntent::Rename { path, new_name } => {
+                    self.controller.rename_entry(&path, &new_name);
+                }
+                ExplorerIntent::Delete { path } => {
+                    self.controller.delete_entry(&path);
+                }
+                ExplorerIntent::Move { path, destination }
+                | ExplorerIntent::DragMove {
+                    source: path,
+                    destination,
+                } => {
+                    self.controller.move_entry(&path, &destination);
+                }
+                ExplorerIntent::Duplicate { path, destination } => {
+                    self.controller.duplicate_entry(&path, &destination);
+                }
+                ExplorerIntent::Reveal { path } => {
+                    if let (Some(vault), Ok(path)) = (&self.controller.vault, VaultPath::new(path))
+                    {
+                        let full = vault.root().join(path.as_path());
+                        let _ = Command::new("xdg-open").arg(full).spawn();
+                    }
+                }
+                ExplorerIntent::Toggle { path, expanded } => {
+                    if let Some(explorer) = &self.explorer {
+                        explorer.update(cx, |view, _| {
+                            if expanded {
+                                view.model_mut().expanded.insert(path.clone());
+                            } else {
+                                view.model_mut().expanded.remove(&path);
+                            }
+                        });
+                    }
+                }
+                ExplorerIntent::SetFilter { value } => {
+                    if let Some(explorer) = &self.explorer {
+                        explorer.update(cx, |view, _| view.model_mut().set_filter(value.clone()));
+                    }
+                }
+                ExplorerIntent::SetSort { mode } => {
+                    if let Some(explorer) = &self.explorer {
+                        let mode = match mode {
+                            tachylyte_navigation_ui::ExplorerSortMode::Name => {
+                                tachylyte_navigation_ui::SortMode::Name
+                            }
+                            tachylyte_navigation_ui::ExplorerSortMode::Modified => {
+                                tachylyte_navigation_ui::SortMode::Modified
+                            }
+                            tachylyte_navigation_ui::ExplorerSortMode::Created => {
+                                tachylyte_navigation_ui::SortMode::Created
+                            }
+                            tachylyte_navigation_ui::ExplorerSortMode::Kind => {
+                                tachylyte_navigation_ui::SortMode::Name
+                            }
+                        };
+                        explorer.update(cx, |view, _| view.model_mut().set_sort_mode(mode));
+                    }
+                }
+                other => self.controller.status = format!("Explorer intent deferred: {other}"),
+            }
+        }
+    }
+
+    fn open_path_in_workspace(&mut self, path: &VaultPath) -> bool {
+        if !self.controller.open_file(path) {
+            return false;
+        }
+        self.workspace.open_reusable_path(path.to_string());
+        true
+    }
+
+    fn sync_workspace_to_controller(&mut self) {
+        if let Some(path) = self.controller.selected_path.clone() {
+            self.workspace.open_reusable_path(path.to_string());
+        }
+    }
+
     fn apply_surface_events(&mut self, cx: &mut Context<Self>) {
         if let Some(graph) = &self.graph {
             for event in graph.drain_events(cx) {
@@ -1098,7 +1285,7 @@ impl Shell {
                     tachylyte_graph_ui::GraphEvent::Select(path)
                     | tachylyte_graph_ui::GraphEvent::Open(path) => {
                         if let Ok(path) = VaultPath::new(path) {
-                            let _ = self.controller.select(&path);
+                            let _ = self.open_path_in_workspace(&path);
                         }
                     }
                 }
@@ -1136,6 +1323,17 @@ impl Shell {
                             | tachylyte_settings_ui::Theme::System => Theme::Light,
                         };
                         save_settings(&self.controller.settings);
+                        if let Some(model) = &mut self.launcher_model {
+                            model.settings_mut().appearance.theme = Some(
+                                match theme {
+                                    tachylyte_settings_ui::Theme::Dark => "dark",
+                                    tachylyte_settings_ui::Theme::Light
+                                    | tachylyte_settings_ui::Theme::System => "light",
+                                }
+                                .into(),
+                            );
+                            let _ = model.save_settings();
+                        }
                     }
                     tachylyte_settings_ui::SettingsEvent::PluginChanged { id, enabled } => {
                         match id.as_str() {
@@ -1156,6 +1354,10 @@ impl Shell {
                             _ => {}
                         }
                         save_settings(&self.controller.settings);
+                        if let Some(model) = &mut self.launcher_model {
+                            model.settings_mut().features.show_missing = enabled;
+                            let _ = model.save_settings();
+                        }
                     }
                     tachylyte_settings_ui::SettingsEvent::CloseRequested => {
                         self.settings_open = false;
@@ -1180,7 +1382,7 @@ impl Shell {
             for intent in switcher.drain_intents(cx) {
                 if let tachylyte_workflow_ui::WorkflowIntent::OpenPath { path } = intent {
                     if let Ok(path) = VaultPath::new(path) {
-                        let _ = self.controller.select(&path);
+                        let _ = self.open_path_in_workspace(&path);
                         self.quick_switcher_open = false;
                     }
                 }
@@ -1224,6 +1426,65 @@ fn set_feature(settings: &mut SettingsState, name: &str, enabled: bool) {
     {
         feature.enabled = enabled;
     }
+}
+
+fn workspace_tab_count(workspace: &Workspace) -> usize {
+    fn count(node: &tachylyte_workspace::LayoutNode) -> usize {
+        match node {
+            tachylyte_workspace::LayoutNode::Tabs(group) => group.tabs.len(),
+            tachylyte_workspace::LayoutNode::Split { first, second, .. } => {
+                count(first) + count(second)
+            }
+        }
+    }
+    workspace
+        .windows
+        .iter()
+        .map(|window| count(&window.root))
+        .sum()
+}
+
+fn workspace_focused_path(workspace: &Workspace) -> Option<String> {
+    fn find(node: &tachylyte_workspace::LayoutNode, id: &str) -> Option<String> {
+        match node {
+            tachylyte_workspace::LayoutNode::Tabs(group) => group
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .and_then(|tab| tab.view.path.clone()),
+            tachylyte_workspace::LayoutNode::Split { first, second, .. } => {
+                find(first, id).or_else(|| find(second, id))
+            }
+        }
+    }
+    let id = workspace.focused_tab_id()?;
+    workspace
+        .windows
+        .iter()
+        .find_map(|window| find(&window.root, &id))
+}
+
+fn workspace_history_state(workspace: &Workspace) -> (bool, bool) {
+    fn find(node: &tachylyte_workspace::LayoutNode, id: &str) -> Option<(bool, bool)> {
+        match node {
+            tachylyte_workspace::LayoutNode::Tabs(group) => group
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| (tab.history.can_back(), tab.history.can_forward())),
+            tachylyte_workspace::LayoutNode::Split { first, second, .. } => {
+                find(first, id).or_else(|| find(second, id))
+            }
+        }
+    }
+    let Some(id) = workspace.focused_tab_id() else {
+        return (false, false);
+    };
+    workspace
+        .windows
+        .iter()
+        .find_map(|window| find(&window.root, &id))
+        .unwrap_or((false, false))
 }
 #[cfg(any())]
 impl Render for Shell {
@@ -1559,6 +1820,7 @@ impl Render for Shell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.apply_surface_events(cx);
         self.ensure_surfaces(cx);
+        self.apply_explorer_intents(cx);
         if let Some(palette) = &self.command_palette {
             palette.sync_query(self.controller.query.clone(), cx);
         }
@@ -1680,7 +1942,9 @@ impl Render for Shell {
                 gpui::MouseButton::Left,
                 move |_, _, cx| {
                     new_note_entity.update(cx, |shell, cx| {
-                        shell.controller.create_note();
+                        if shell.controller.create_note() {
+                            shell.sync_workspace_to_controller();
+                        }
                         cx.notify();
                     });
                 },
@@ -1725,36 +1989,7 @@ impl Render for Shell {
                 },
             ));
 
-        let rows = self
-            .controller
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let path = entry.path.clone();
-                let label = entry.path.to_string();
-                let is_selected = label == selected;
-                let row_entity = entity.clone();
-                div()
-                    .id(("explorer-file", index))
-                    .w_full()
-                    .h(px(28.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_size(px(13.))
-                    .text_color(if is_selected { text } else { muted })
-                    .bg(if is_selected { selected_surface } else { panel })
-                    .hover(|style| style.bg(tokens.hover()))
-                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                        row_entity.update(cx, |shell, cx| {
-                            shell.controller.select(&path);
-                            cx.notify();
-                        });
-                    })
-                    .child(format!("▱  {label}"))
-            });
-
+        let explorer_entity = self.explorer.clone();
         let explorer = if self.controller.settings.show_left_sidebar
             && self.controller.settings.feature_enabled("File explorer")
         {
@@ -1766,42 +2001,8 @@ impl Render for Shell {
                 .border_1()
                 .border_color(border)
                 .bg(panel)
-                .child(
-                    div()
-                        .h(px(44.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(11.))
-                        .text_color(muted)
-                        .child("VAULT")
-                        .child(div().flex().gap_2().child("⌕").child("•••")),
-                )
-                .child(
-                    div()
-                        .px_3()
-                        .pb_2()
-                        .text_size(px(11.))
-                        .text_color(muted)
-                        .child("FILES"),
-                )
-                .children(rows)
+                .child(explorer_entity.expect("explorer is mounted before render"))
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .h(px(42.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .border_1()
-                        .border_color(border)
-                        .text_size(px(12.))
-                        .text_color(muted)
-                        .child("⌄  Vault files")
-                        .child("↗"),
-                )
         } else {
             div().w(px(0.))
         };
@@ -1826,6 +2027,14 @@ impl Render for Shell {
         };
 
         let close_title = close_entity.clone();
+        let tab_controls = self
+            .controller
+            .tab_controls(workspace_tab_count(&self.workspace));
+        let split_entity = entity.clone();
+        let split_tab = self.workspace.focused_tab_id();
+        let (can_back, can_forward) = workspace_history_state(&self.workspace);
+        let back_entity = entity.clone();
+        let forward_entity = entity.clone();
         let tab_strip = div()
             .h(px(38.))
             .flex()
@@ -1848,16 +2057,45 @@ impl Render for Shell {
                     .child(format!("▱  {title}")),
             )
             .child(div().flex_1())
+            .child(if tab_controls.can_split {
+                div()
+                    .id("split-note-tab")
+                    .px_2()
+                    .text_color(accent)
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                        if let Some(tab) = split_tab.clone() {
+                            split_entity.update(cx, |shell, cx| {
+                                shell.workspace.split(&tab, Orientation::Horizontal);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child("Split")
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(
                 div()
                     .id("close-note-tab")
                     .px_3()
                     .text_color(muted)
-                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                        close_title.update(cx, |shell, cx| {
-                            shell.controller.try_close_document();
-                            cx.notify();
-                        });
+                    .when(tab_controls.can_close, |el| {
+                        el.on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                            close_title.update(cx, |shell, cx| {
+                                if shell.controller.try_close_document() {
+                                    if let Some(tab) = shell.workspace.focused_tab_id() {
+                                        shell.workspace.close(&tab);
+                                    }
+                                    if let Some(path) = workspace_focused_path(&shell.workspace)
+                                        .and_then(|path| VaultPath::new(path).ok())
+                                    {
+                                        let _ = shell.controller.open_file(&path);
+                                    }
+                                    cx.notify();
+                                }
+                            });
+                        })
                     })
                     .child("×"),
             )
@@ -1868,7 +2106,9 @@ impl Render for Shell {
                     .text_color(accent)
                     .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                         plus_entity.update(cx, |shell, cx| {
-                            shell.controller.create_note();
+                            if shell.controller.create_note() {
+                                shell.sync_workspace_to_controller();
+                            }
                             cx.notify();
                         });
                     })
@@ -1930,7 +2170,43 @@ impl Render for Shell {
                     .border_color(border)
                     .text_color(muted)
                     .text_size(px(12.))
-                    .child("‹  ›   ⌂  /  Notes")
+                    .child(
+                        div()
+                            .id("history-back")
+                            .when(can_back, |el| {
+                                el.on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                    back_entity.update(cx, |shell, cx| {
+                                        shell.workspace.back();
+                                        if let Some(path) = workspace_focused_path(&shell.workspace)
+                                            .and_then(|path| VaultPath::new(path).ok())
+                                        {
+                                            let _ = shell.controller.open_file(&path);
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                            })
+                            .child("‹"),
+                    )
+                    .child(
+                        div()
+                            .id("history-forward")
+                            .when(can_forward, |el| {
+                                el.on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                                    forward_entity.update(cx, |shell, cx| {
+                                        shell.workspace.forward();
+                                        if let Some(path) = workspace_focused_path(&shell.workspace)
+                                            .and_then(|path| VaultPath::new(path).ok())
+                                        {
+                                            let _ = shell.controller.open_file(&path);
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                            })
+                            .child("›"),
+                    )
+                    .child("   ⌂  /  Notes")
                     .child("⋮"),
             )
             .child(
@@ -2339,6 +2615,20 @@ mod tests {
         assert!(c.select(&VaultPath::new("photo.png").unwrap()));
         assert!(matches!(c.leaf_kind(), LeafKind::Media(FileKind::Image)));
         assert!(c.document.is_none());
+    }
+
+    #[test]
+    fn workspace_bridge_reuses_paths_and_tracks_tab_controls() {
+        let mut workspace = Workspace::default();
+        let first = workspace.open_reusable_path("a.md");
+        let reused = workspace.open_reusable_path("a.md");
+        assert_eq!(first, reused);
+        let second = workspace.open_reusable_path("b.md");
+        assert_ne!(first, second);
+        assert_eq!(workspace_tab_count(&workspace), 2);
+        let controls =
+            tab_policy::TabControls::from_workspace(true, false, workspace_tab_count(&workspace));
+        assert!(controls.can_split);
     }
     #[test]
     fn palette_commands_and_feature_projection_are_deterministic() {

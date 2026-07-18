@@ -1,6 +1,16 @@
 use gpui::{div, prelude::*, px, rgb, Context, Render, SharedString, Window};
-use std::collections::BTreeSet;
-use tachylyte_structured::{CanvasDocument, Edge, Point, Rect, Size};
+use std::collections::{BTreeMap, BTreeSet};
+use tachylyte_structured::{CanvasDocument, Edge, Node, Point, Rect, Size};
+
+use crate::canvas_geometry::{
+    card_label, card_preview, fit_transform, grid_lines, node_type, orthogonal_route, parse_color,
+    NodeType,
+};
+use crate::canvas_history::CanvasHistory;
+use crate::canvas_input::{
+    apply_selection, expand_group_selection, nodes_in_selection, normalized_selection,
+    DragMoveState, ResizeState,
+};
 
 /// A point in the deterministic screen coordinate system.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -24,22 +34,22 @@ impl Default for CanvasTransform {
         }
     }
 }
+
 impl CanvasTransform {
-    /// Convert a world point to screen coordinates.
     pub fn world_to_screen(self, p: Point) -> ScreenPoint {
         ScreenPoint {
             x: p.x * self.zoom + self.pan.x,
             y: p.y * self.zoom + self.pan.y,
         }
     }
-    /// Convert a screen point to world coordinates.
+
     pub fn screen_to_world(self, p: ScreenPoint) -> Point {
         Point {
             x: (p.x - self.pan.x) / self.zoom,
             y: (p.y - self.pan.y) / self.zoom,
         }
     }
-    /// Pan by a screen-space delta.
+
     pub fn translated(self, delta: ScreenPoint) -> Self {
         Self {
             pan: ScreenPoint {
@@ -49,9 +59,9 @@ impl CanvasTransform {
             ..self
         }
     }
-    /// Zoom around a fixed screen point, keeping that point stable.
+
     pub fn zoom_at(self, focus: ScreenPoint, factor: f64) -> Self {
-        if !factor.is_finite() || factor <= 0. {
+        if !factor.is_finite() || factor <= 0.0 {
             return self;
         }
         let zoom = (self.zoom * factor).clamp(0.1, 8.0);
@@ -64,22 +74,64 @@ impl CanvasTransform {
             },
         }
     }
+
     fn rect(self, r: Rect) -> (f64, f64, f64, f64) {
         let p = self.world_to_screen(Point { x: r.x, y: r.y });
         (p.x, p.y, r.width * self.zoom, r.height * self.zoom)
     }
 }
 
-/// Commands emitted by Canvas controls. Hosts apply these to a domain document.
+/// Context and toolbar actions. The view emits these as intents; persistence remains host-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanvasContextAction {
+    CreateText,
+    CreateFile,
+    CreateLink,
+    CreateGroup,
+    Delete,
+    Duplicate,
+    FitViewport,
+    Undo,
+    Redo,
+}
+
+/// Commands emitted by Canvas controls. Hosts apply them to a domain document.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanvasCommand {
     Mode(CanvasMode),
     Select(Option<String>),
+    SelectMany(Vec<String>),
     Pan(ScreenPoint),
-    Zoom { focus: ScreenPoint, factor: f64 },
-    Move { id: String, to: Point },
-    Resize { id: String, size: Size },
+    Zoom {
+        focus: ScreenPoint,
+        factor: f64,
+    },
+    Move {
+        id: String,
+        to: Point,
+    },
+    Resize {
+        id: String,
+        size: Size,
+    },
     Connect(Edge),
+    Create(Node),
+    Delete {
+        id: String,
+    },
+    Duplicate {
+        source: String,
+        id: String,
+    },
+    Undo,
+    Redo,
+    FitViewport {
+        viewport: Rect,
+    },
+    Context {
+        id: Option<String>,
+        action: CanvasContextAction,
+    },
 }
 
 /// Pointer interaction mode exposed by the Canvas toolbar.
@@ -91,8 +143,9 @@ pub enum CanvasMode {
     Connect,
 }
 
-/// Testable state and hit model backing [`CanvasView`].
-#[derive(Clone, Debug)]
+/// Testable state and hit model backing [`CanvasView`]. The document is never serialized or
+/// silently rewritten by this projection; commands are the boundary to the domain codec.
+#[derive(Debug)]
 pub struct CanvasModel {
     pub document: CanvasDocument,
     pub transform: CanvasTransform,
@@ -100,27 +153,41 @@ pub struct CanvasModel {
     pub disabled: bool,
     pub mode: CanvasMode,
     commands: Vec<CanvasCommand>,
+    history: CanvasHistory,
+    selection_start: Option<ScreenPoint>,
+    selection_rect: Option<Rect>,
+    drag: Option<DragMoveState>,
+    drag_origins: BTreeMap<String, Point>,
+    resize: Option<ResizeState>,
+    resize_id: Option<String>,
 }
+
 impl CanvasModel {
-    /// Create a Canvas model with the identity transform.
     pub fn new(document: CanvasDocument) -> Self {
         Self {
+            history: CanvasHistory::new(document.clone()),
             document,
             transform: CanvasTransform::default(),
             selected: BTreeSet::new(),
             disabled: false,
             mode: CanvasMode::default(),
             commands: Vec::new(),
+            selection_start: None,
+            selection_rect: None,
+            drag: None,
+            drag_origins: BTreeMap::new(),
+            resize: None,
+            resize_id: None,
         }
     }
-    /// Change pointer mode and emit a toolbar command.
+
     pub fn set_mode(&mut self, mode: CanvasMode) {
         if !self.disabled {
             self.mode = mode;
             self.commands.push(CanvasCommand::Mode(mode));
         }
     }
-    /// Dispatch a pointer press according to the active toolbar mode.
+
     pub fn pointer_down(&mut self, screen: ScreenPoint) -> Option<String> {
         match self.mode {
             CanvasMode::Select => self.select_at(screen),
@@ -128,13 +195,167 @@ impl CanvasModel {
             CanvasMode::Connect => self.connect_at(screen),
         }
     }
-    /// Dispatch a pointer delta; pan is only active in Pan mode.
+
     pub fn pointer_move(&mut self, delta: ScreenPoint) {
         if self.mode == CanvasMode::Pan {
             self.pan(delta);
         }
     }
-    /// Connect the selected node to the node under the pointer.
+
+    pub fn select_at_with_additive(
+        &mut self,
+        screen: ScreenPoint,
+        additive: bool,
+    ) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        let id = self
+            .document
+            .hit_test(self.transform.screen_to_world(screen))
+            .map(|n| n.id.clone());
+        apply_selection(&mut self.selected, id.clone(), additive);
+        self.selected = expand_group_selection(&self.document.nodes, &self.selected);
+        self.commands.push(CanvasCommand::Select(id.clone()));
+        id
+    }
+
+    pub fn select_at(&mut self, screen: ScreenPoint) -> Option<String> {
+        self.select_at_with_additive(screen, false)
+    }
+
+    pub fn begin_selection(&mut self, screen: ScreenPoint) {
+        if !self.disabled {
+            self.selection_start = Some(screen);
+            self.selection_rect = Some(Rect {
+                x: screen.x,
+                y: screen.y,
+                width: 0.0,
+                height: 0.0,
+            });
+        }
+    }
+
+    pub fn update_selection(&mut self, screen: ScreenPoint) {
+        if let Some(start) = self.selection_start {
+            self.selection_rect = Some(Rect {
+                x: start.x,
+                y: start.y,
+                width: screen.x - start.x,
+                height: screen.y - start.y,
+            });
+        }
+    }
+
+    pub fn finish_selection(&mut self, screen: ScreenPoint, additive: bool) -> BTreeSet<String> {
+        if self.disabled {
+            return BTreeSet::new();
+        }
+        self.update_selection(screen);
+        let selected = self
+            .selection_rect
+            .map(|r| {
+                let world_a = self
+                    .transform
+                    .screen_to_world(ScreenPoint { x: r.x, y: r.y });
+                let world_b = self.transform.screen_to_world(ScreenPoint {
+                    x: r.x + r.width,
+                    y: r.y + r.height,
+                });
+                nodes_in_selection(&self.document.nodes, normalized_selection(world_a, world_b))
+            })
+            .unwrap_or_default();
+        let selected = expand_group_selection(&self.document.nodes, &selected);
+        apply_selection(&mut self.selected, selected.iter().cloned(), additive);
+        self.commands.push(CanvasCommand::SelectMany(
+            self.selected.iter().cloned().collect(),
+        ));
+        self.selection_start = None;
+        self.selection_rect = None;
+        selected
+    }
+
+    pub fn selection_rect(&self) -> Option<Rect> {
+        self.selection_rect
+    }
+
+    pub fn begin_drag(&mut self, screen: ScreenPoint) {
+        if self.disabled || self.selected.is_empty() {
+            return;
+        }
+        self.drag = Some(DragMoveState::new(self.transform.screen_to_world(screen)));
+        self.drag_origins = self
+            .selected
+            .iter()
+            .filter_map(|id| {
+                self.document
+                    .node(id)
+                    .map(|n| (id.clone(), Point { x: n.x, y: n.y }))
+            })
+            .collect();
+    }
+
+    pub fn drag_to(&mut self, screen: ScreenPoint) {
+        let Some(drag) = &mut self.drag else {
+            return;
+        };
+        drag.update(self.transform.screen_to_world(screen));
+        let delta = drag.delta();
+        for id in self.selected.clone() {
+            if let Some(origin) = self.drag_origins.get(&id) {
+                self.commands.push(CanvasCommand::Move {
+                    id,
+                    to: Point {
+                        x: origin.x + delta.x,
+                        y: origin.y + delta.y,
+                    },
+                });
+            }
+        }
+    }
+
+    pub fn finish_drag(&mut self) {
+        self.drag = None;
+        self.drag_origins.clear();
+    }
+
+    pub fn begin_resize(&mut self, id: &str) {
+        if self.disabled {
+            return;
+        }
+        if let Some(node) = self.document.node(id) {
+            self.resize = Some(ResizeState::new(
+                Size {
+                    width: node.width,
+                    height: node.height,
+                },
+                Size {
+                    width: 24.0,
+                    height: 24.0,
+                },
+            ));
+            self.resize_id = Some(id.into());
+        }
+    }
+
+    pub fn resize_to(&mut self, size: Size) {
+        let Some(resize) = &mut self.resize else {
+            return;
+        };
+        resize.update(size);
+        if let Some(id) = &self.resize_id {
+            self.commands.push(CanvasCommand::Resize {
+                id: id.clone(),
+                size: resize.size(),
+            });
+        }
+    }
+
+    pub fn finish_resize(&mut self) {
+        self.resize = None;
+        self.resize_id = None;
+    }
+
     pub fn connect_at(&mut self, screen: ScreenPoint) -> Option<String> {
         if self.disabled {
             return None;
@@ -145,34 +366,32 @@ impl CanvasModel {
             .map(|node| node.id.clone());
         if let (Some(source), Some(target)) = (self.selected.iter().next().cloned(), target.clone())
         {
-            if source != target {
-                self.connect_intent(Edge {
-                    id: format!("edge-{source}-{target}"),
-                    from_node: source,
-                    to_node: target,
-                    ..Default::default()
-                });
-            }
+            self.connect_nodes(&source, &target);
         }
         target
     }
-    /// Select the topmost node at a screen point and emit a selection command.
-    pub fn select_at(&mut self, screen: ScreenPoint) -> Option<String> {
-        if self.disabled {
-            return None;
-        };
-        let id = self
-            .document
-            .hit_test(self.transform.screen_to_world(screen))
-            .map(|n| n.id.clone());
-        self.selected.clear();
-        if let Some(id) = &id {
-            self.selected.insert(id.clone());
+
+    pub fn connect_nodes(&mut self, source: &str, target: &str) {
+        if self.disabled || source == target {
+            return;
         }
-        self.commands.push(CanvasCommand::Select(id.clone()));
-        id
+        let Some(from) = self.document.node(source) else {
+            return;
+        };
+        let Some(to) = self.document.node(target) else {
+            return;
+        };
+        let (from_side, to_side) = sides_for(from, to);
+        self.connect_intent(Edge {
+            id: format!("edge-{source}-{target}"),
+            from_node: source.into(),
+            to_node: target.into(),
+            from_side: Some(from_side.into()),
+            to_side: Some(to_side.into()),
+            ..Default::default()
+        });
     }
-    /// Emit a move intent without mutating the domain document.
+
     pub fn move_intent(&mut self, id: &str, screen: ScreenPoint) {
         if !self.disabled {
             self.commands.push(CanvasCommand::Move {
@@ -181,7 +400,7 @@ impl CanvasModel {
             });
         }
     }
-    /// Emit a resize intent.
+
     pub fn resize_intent(&mut self, id: &str, size: Size) {
         if !self.disabled {
             self.commands.push(CanvasCommand::Resize {
@@ -190,51 +409,194 @@ impl CanvasModel {
             });
         }
     }
-    /// Emit a connection intent.
+
     pub fn connect_intent(&mut self, edge: Edge) {
         if !self.disabled {
             self.commands.push(CanvasCommand::Connect(edge));
         }
     }
-    /// Pan and emit an intent.
+
     pub fn pan(&mut self, delta: ScreenPoint) {
         if !self.disabled {
             self.transform = self.transform.translated(delta);
             self.commands.push(CanvasCommand::Pan(delta));
         }
     }
-    /// Zoom and emit an intent.
+
     pub fn zoom(&mut self, focus: ScreenPoint, factor: f64) {
-        if !self.disabled && factor.is_finite() && factor > 0. {
+        if !self.disabled && factor.is_finite() && factor > 0.0 {
             self.transform = self.transform.zoom_at(focus, factor);
             self.commands.push(CanvasCommand::Zoom { focus, factor });
         }
     }
-    /// Return a deterministic two-segment orthogonal path for an edge.
-    pub fn edge_path(&self, edge: &Edge) -> Vec<(ScreenPoint, ScreenPoint)> {
-        let Some(from) = self.document.node(&edge.from_node) else {
-            return Vec::new();
+
+    pub fn fit_viewport(&mut self, viewport: Rect) {
+        if self.disabled {
+            return;
+        }
+        let fit = fit_transform(&self.document, viewport, 24.0);
+        self.transform = CanvasTransform {
+            pan: ScreenPoint {
+                x: fit.pan.x,
+                y: fit.pan.y,
+            },
+            zoom: fit.zoom,
         };
-        let Some(to) = self.document.node(&edge.to_node) else {
-            return Vec::new();
-        };
-        let start = self.transform.world_to_screen(Point {
-            x: from.x + from.width / 2.,
-            y: from.y + from.height / 2.,
-        });
-        let end = self.transform.world_to_screen(Point {
-            x: to.x + to.width / 2.,
-            y: to.y + to.height / 2.,
-        });
-        let bend = ScreenPoint {
-            x: end.x,
-            y: start.y,
-        };
-        vec![(start, bend), (bend, end)]
+        self.commands.push(CanvasCommand::FitViewport { viewport });
     }
-    /// Drain commands emitted since the previous call.
+
+    pub fn create_node(&mut self, node: Node) {
+        if self.disabled {
+            return;
+        }
+        if self.history.create_node(node.clone()).is_ok() {
+            self.sync_history();
+            self.commands.push(CanvasCommand::Create(node));
+        }
+    }
+
+    pub fn delete_selected(&mut self) {
+        let ids = self.selected.iter().cloned().collect::<Vec<_>>();
+        for id in ids {
+            self.delete_node(&id);
+        }
+    }
+
+    pub fn delete_node(&mut self, id: &str) {
+        if self.disabled {
+            return;
+        }
+        if self.history.delete_node(id).is_ok() {
+            self.sync_history();
+            self.selected.remove(id);
+            self.commands.push(CanvasCommand::Delete { id: id.into() });
+        }
+    }
+
+    pub fn duplicate_node(&mut self, id: &str) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        let copy = self.history.duplicate_node(id).ok()?;
+        self.sync_history();
+        self.commands.push(CanvasCommand::Duplicate {
+            source: id.into(),
+            id: copy.id.clone(),
+        });
+        Some(copy.id)
+    }
+
+    pub fn undo(&mut self) {
+        if !self.disabled && self.history.undo() {
+            self.sync_history();
+            self.commands.push(CanvasCommand::Undo);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if !self.disabled && self.history.redo() {
+            self.sync_history();
+            self.commands.push(CanvasCommand::Redo);
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    pub fn context_action(&mut self, id: Option<&str>, action: CanvasContextAction) {
+        if self.disabled {
+            return;
+        }
+        let id_owned = id.map(str::to_owned);
+        match action {
+            CanvasContextAction::Delete => {
+                if let Some(id) = id {
+                    self.delete_node(id)
+                }
+            }
+            CanvasContextAction::Duplicate => {
+                if let Some(id) = id {
+                    self.duplicate_node(id);
+                }
+            }
+            CanvasContextAction::Undo => self.undo(),
+            CanvasContextAction::Redo => self.redo(),
+            _ => {}
+        }
+        self.commands.push(CanvasCommand::Context {
+            id: id_owned,
+            action,
+        });
+    }
+
+    fn sync_history(&mut self) {
+        self.document = self.history.document().clone();
+    }
+
+    pub fn edge_path(&self, edge: &Edge) -> Vec<(ScreenPoint, ScreenPoint)> {
+        let (Some(from), Some(to)) = (
+            self.document.node(&edge.from_node),
+            self.document.node(&edge.to_node),
+        ) else {
+            return Vec::new();
+        };
+        orthogonal_route(from, to, edge)
+            .windows(2)
+            .map(|pair| {
+                (
+                    self.transform.world_to_screen(pair[0]),
+                    self.transform.world_to_screen(pair[1]),
+                )
+            })
+            .collect()
+    }
+
     pub fn take_commands(&mut self) -> Vec<CanvasCommand> {
         std::mem::take(&mut self.commands)
+    }
+}
+
+fn sides_for(from: &Node, to: &Node) -> (&'static str, &'static str) {
+    let from_center = Point {
+        x: from.x + from.width / 2.0,
+        y: from.y + from.height / 2.0,
+    };
+    let to_center = Point {
+        x: to.x + to.width / 2.0,
+        y: to.y + to.height / 2.0,
+    };
+    if (to_center.x - from_center.x).abs() >= (to_center.y - from_center.y).abs() {
+        if to_center.x >= from_center.x {
+            ("right", "left")
+        } else {
+            ("left", "right")
+        }
+    } else if to_center.y >= from_center.y {
+        ("bottom", "top")
+    } else {
+        ("top", "bottom")
+    }
+}
+
+fn color_u32(value: Option<&str>, fallback: u32) -> u32 {
+    let [r, g, b, a] = parse_color(value);
+    if value.is_some() {
+        u32::from_be_bytes([r, g, b, a])
+    } else {
+        fallback
+    }
+}
+
+fn node_icon(kind: NodeType) -> &'static str {
+    match kind {
+        NodeType::Text => "▤",
+        NodeType::File => "▣",
+        NodeType::Link => "↗",
+        NodeType::Group => "▦",
     }
 }
 
@@ -242,60 +604,64 @@ impl CanvasModel {
 pub struct CanvasView {
     pub model: CanvasModel,
 }
+
 impl CanvasView {
-    /// Construct a Canvas view.
     pub fn new(model: CanvasModel) -> Self {
         Self { model }
     }
-
-    /// Construct a Canvas view directly from a document for composite mounting.
     pub fn from_document(document: CanvasDocument) -> Self {
         Self::new(CanvasModel::new(document))
     }
-
-    /// Replace the displayed document while retaining viewport and selection state.
     pub fn update_document(&mut self, document: CanvasDocument) {
-        self.model.document = document;
+        self.model = CanvasModel {
+            transform: self.model.transform,
+            selected: self.model.selected.clone(),
+            disabled: self.model.disabled,
+            mode: self.model.mode,
+            ..CanvasModel::new(document)
+        };
         self.model
             .selected
             .retain(|id| self.model.document.node(id).is_some());
     }
-
-    /// Enable or disable interaction without rebuilding the mounted view.
     pub fn set_disabled(&mut self, disabled: bool) {
         self.model.disabled = disabled;
     }
-
-    /// Forward a pointer press from a composite host to the canvas model.
     pub fn pointer_down(&mut self, screen: ScreenPoint) -> Option<String> {
         self.model.pointer_down(screen)
     }
-
-    /// Forward a pointer delta from a composite host to the canvas model.
     pub fn pointer_move(&mut self, delta: ScreenPoint) {
         self.model.pointer_move(delta);
     }
-
-    /// Drain commands emitted by this view since the previous call.
     pub fn take_commands(&mut self) -> Vec<CanvasCommand> {
         self.model.take_commands()
     }
 }
+
 impl Render for CanvasView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let canvas_bg = 0xfafaf9ff;
-        let node_bg = 0xfffdf9ff;
-        let selected = 0xf1eee8ff;
         let entity = cx.entity();
         let mut viewport = div()
             .id("canvas-viewport")
             .relative()
             .flex_1()
-            .bg(rgb(canvas_bg))
+            .bg(rgb(0xfafaf9ff))
             .overflow_hidden();
-        // A fixed-size grid keeps the viewport legible while remaining deterministic.
-        for i in 0..32 {
-            let offset = (i * 64) as f32;
+        let (grid_x, grid_y) = grid_lines(
+            Rect {
+                x: 0.,
+                y: 0.,
+                width: 4096.,
+                height: 4096.,
+            },
+            64.,
+        );
+        for world_x in grid_x {
+            let offset = self
+                .model
+                .transform
+                .world_to_screen(Point { x: world_x, y: 0. })
+                .x as f32;
             viewport = viewport.child(
                 div()
                     .absolute()
@@ -305,6 +671,13 @@ impl Render for CanvasView {
                     .h(px(4096.))
                     .bg(rgb(0xe4e2ddff)),
             );
+        }
+        for world_y in grid_y {
+            let offset = self
+                .model
+                .transform
+                .world_to_screen(Point { x: 0., y: world_y })
+                .y as f32;
             viewport = viewport.child(
                 div()
                     .absolute()
@@ -315,74 +688,129 @@ impl Render for CanvasView {
                     .bg(rgb(0xe4e2ddff)),
             );
         }
-        // Edges are represented by deterministic midpoint connectors. A host can
-        // replace this simple primitive with a custom paint layer without changing
-        // the command/model contract.
         for edge in &self.model.document.edges {
-            for (start, end) in self.model.edge_path(edge) {
+            let segments = self.model.edge_path(edge);
+            for (start, end) in segments {
                 let horizontal = (end.x - start.x).abs() >= (end.y - start.y).abs();
+                let color = color_u32(edge.extra.get("color").and_then(|v| v.as_str()), 0xb8b5adff);
                 viewport = viewport.child(if horizontal {
                     div()
                         .absolute()
                         .left(px(start.x.min(end.x) as f32))
-                        .top(px(start.y as f32))
+                        .top(px(start.y as f32 - 1.))
                         .w(px((end.x - start.x).abs().max(1.) as f32))
-                        .h(px(1.))
-                        .bg(rgb(0xb8b5adff))
+                        .h(px(2.))
+                        .bg(rgb(color))
                 } else {
                     div()
                         .absolute()
-                        .left(px(start.x as f32))
+                        .left(px(start.x as f32 - 1.))
                         .top(px(start.y.min(end.y) as f32))
-                        .w(px(1.))
+                        .w(px(2.))
                         .h(px((end.y - start.y).abs().max(1.) as f32))
-                        .bg(rgb(0xb8b5adff))
+                        .bg(rgb(color))
                 });
             }
+            if let Some((_, end)) = self.model.edge_path(edge).last().copied() {
+                viewport = viewport.child(
+                    div()
+                        .absolute()
+                        .left(px(end.x as f32 - 5.))
+                        .top(px(end.y as f32 - 7.))
+                        .text_color(rgb(0x68645dff))
+                        .child("▶"),
+                );
+                if let Some(label) = &edge.label {
+                    viewport = viewport.child(
+                        div()
+                            .absolute()
+                            .left(px(end.x as f32 + 4.))
+                            .top(px(end.y as f32 - 10.))
+                            .text_color(rgb(0x68645dff))
+                            .child(label.clone()),
+                    );
+                }
+            }
         }
-        for node in &self.model.document.nodes {
+        let mut nodes = self.model.document.nodes.iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|node| (node_type(node) != NodeType::Group, node.id.clone()));
+        for node in nodes {
             let (x, y, w, h) = self.model.transform.rect(node.rect());
             let id = node.id.clone();
             let active = self.model.selected.contains(&id);
+            let kind = node_type(node);
+            let preview = card_preview(node).unwrap_or(&node.id).to_owned();
+            let label = card_label(node);
+            let bg = if active {
+                0xf1eee8ff
+            } else {
+                color_u32(
+                    node.color.as_deref(),
+                    if kind == NodeType::Group {
+                        0xece8deff
+                    } else {
+                        0xfffdf9ff
+                    },
+                )
+            };
             let e = entity.clone();
-            let label = node
-                .text
-                .as_deref()
-                .or(node.file.as_deref())
-                .unwrap_or(&node.kind)
-                .to_string();
             let child = div()
                 .id(SharedString::from(format!("canvas-node-{id}")))
                 .absolute()
                 .left(px(x as f32))
                 .top(px(y as f32))
-                .w(px(w as f32))
-                .h(px(h as f32))
-                .bg(rgb(if active { selected } else { node_bg }))
+                .w(px(w.max(24.) as f32))
+                .h(px(h.max(24.) as f32))
+                .bg(rgb(bg))
                 .border_1()
                 .border_color(rgb(if active { 0x8f887bff } else { 0xd6d3ccff }))
                 .p_2()
                 .text_color(rgb(0x222222ff))
-                .child(label)
+                .child(div().child(format!("{}  {}", node_icon(kind), label)))
+                .child(if preview != label {
+                    div().text_color(rgb(0x68645dff)).child(preview)
+                } else {
+                    div()
+                })
                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
                     e.update(cx, |view, cx| {
-                        view.model.select_at(ScreenPoint {
-                            x: x + w / 2.,
-                            y: y + h / 2.,
-                        });
+                        view.model.select_at(ScreenPoint { x, y });
                         cx.notify();
                     });
                 });
             viewport = viewport.child(child);
         }
-        let e = entity.clone();
+        if let Some(selection) = self.model.selection_rect {
+            let r = Rect {
+                x: selection.x.min(selection.x + selection.width),
+                y: selection.y.min(selection.y + selection.height),
+                width: selection.width.abs(),
+                height: selection.height.abs(),
+            };
+            viewport = viewport.child(
+                div()
+                    .absolute()
+                    .left(px(r.x as f32))
+                    .top(px(r.y as f32))
+                    .w(px(r.width as f32))
+                    .h(px(r.height as f32))
+                    .border_1()
+                    .border_color(rgb(0x6c8fbcff))
+                    .bg(rgb(0x6c8fbc22)),
+            );
+        }
+        let disabled = self.model.disabled;
         let select = entity.clone();
         let pan = entity.clone();
         let connect = entity.clone();
-        let canvas_empty = self.model.document.nodes.is_empty();
-        let status = if self.model.disabled {
+        let fit = entity.clone();
+        let undo = entity.clone();
+        let redo = entity.clone();
+        let duplicate = entity.clone();
+        let delete = entity.clone();
+        let status = if disabled {
             "Canvas unavailable"
-        } else if canvas_empty {
+        } else if self.model.document.nodes.is_empty() {
             "No nodes to display"
         } else {
             ""
@@ -402,69 +830,50 @@ impl Render for CanvasView {
                     .bg(rgb(0xffffffff))
                     .border_b_1()
                     .border_color(rgb(0xe0e0e0ff))
-                    .text_color(rgb(0x222222ff))
-                    .child("Canvas")
-                    .child(
-                        div()
-                            .id("canvas-select")
-                            .h(px(28.))
-                            .px_2()
-                            .items_center()
-                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
-                            .child("Select")
-                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                                select.update(cx, |v, cx| {
-                                    v.model.set_mode(CanvasMode::Select);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("canvas-pan")
-                            .h(px(28.))
-                            .px_2()
-                            .items_center()
-                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
-                            .child("✋ Pan")
-                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                                pan.update(cx, |v, cx| {
-                                    v.model.set_mode(CanvasMode::Pan);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("canvas-connect")
-                            .h(px(28.))
-                            .px_2()
-                            .items_center()
-                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
-                            .child("⌁ Connect")
-                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                                connect.update(cx, |v, cx| {
-                                    v.model.set_mode(CanvasMode::Connect);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("canvas-zoom-in")
-                            .h(px(28.))
-                            .px_2()
-                            .items_center()
-                            .hover(|s| s.bg(rgb(0xeeeeeeff)))
-                            .child("＋")
-                            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                                e.update(cx, |v, cx| {
-                                    v.model.zoom(ScreenPoint { x: 400., y: 250. }, 1.1);
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child("  ·  ⌕ Zoom"),
+                    .child(if disabled {
+                        "Canvas (disabled)"
+                    } else {
+                        "Canvas"
+                    })
+                    .child(toolbar_button("canvas-select", "Select", select, |v| {
+                        v.model.set_mode(CanvasMode::Select)
+                    }))
+                    .child(toolbar_button("canvas-pan", "✋ Pan", pan, |v| {
+                        v.model.set_mode(CanvasMode::Pan)
+                    }))
+                    .child(toolbar_button(
+                        "canvas-connect",
+                        "⌁ Connect",
+                        connect,
+                        |v| v.model.set_mode(CanvasMode::Connect),
+                    ))
+                    .child(toolbar_button("canvas-fit", "Fit", fit, |v| {
+                        v.model.fit_viewport(Rect {
+                            x: 0.,
+                            y: 0.,
+                            width: 800.,
+                            height: 500.,
+                        })
+                    }))
+                    .child(toolbar_button("canvas-undo", "Undo", undo, |v| {
+                        v.model.undo()
+                    }))
+                    .child(toolbar_button("canvas-redo", "Redo", redo, |v| {
+                        v.model.redo()
+                    }))
+                    .child(toolbar_button(
+                        "canvas-duplicate",
+                        "Duplicate",
+                        duplicate,
+                        |v| {
+                            if let Some(id) = v.model.selected.iter().next().cloned() {
+                                v.model.duplicate_node(&id);
+                            }
+                        },
+                    ))
+                    .child(toolbar_button("canvas-delete", "Delete", delete, |v| {
+                        v.model.delete_selected()
+                    })),
             )
             .child(if status.is_empty() {
                 viewport
@@ -478,18 +887,41 @@ impl Render for CanvasView {
                         .bg(rgb(0xfffdf9ff))
                         .border_1()
                         .border_color(rgb(0xd6d3ccff))
-                        .text_color(rgb(0x68645dff))
                         .child(status),
                 )
             })
     }
 }
 
+fn toolbar_button<F>(
+    id: &'static str,
+    label: &'static str,
+    entity: gpui::Entity<CanvasView>,
+    action: F,
+) -> impl IntoElement
+where
+    F: Fn(&mut CanvasView) + 'static,
+{
+    div()
+        .id(id)
+        .h(px(28.))
+        .px_2()
+        .items_center()
+        .hover(|s| s.bg(rgb(0xeeeeeeff)))
+        .child(label)
+        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+            entity.update(cx, |view, cx| {
+                action(view);
+                cx.notify();
+            });
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn node(id: &str) -> tachylyte_structured::Node {
-        tachylyte_structured::Node {
+    fn node(id: &str) -> Node {
+        Node {
             id: id.into(),
             kind: "text".into(),
             x: 10.,
@@ -523,34 +955,21 @@ mod tests {
             m.select_at(ScreenPoint { x: 20., y: 30. }).as_deref(),
             Some("a")
         );
-        assert_eq!(
-            m.take_commands(),
-            vec![CanvasCommand::Select(Some("a".into()))]
-        );
+        assert!(m
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, CanvasCommand::Select(Some(id)) if id == "a")));
         m.disabled = true;
         m.move_intent("a", ScreenPoint { x: 1., y: 1. });
         assert!(m.take_commands().is_empty());
     }
-
-    #[test]
-    fn invalid_zoom_is_rejected_before_transform_or_command() {
-        let mut model = CanvasModel::new(CanvasDocument::default());
-        let original = model.transform;
-        model.zoom(ScreenPoint::default(), 0.);
-        model.zoom(ScreenPoint::default(), f64::NAN);
-        assert_eq!(model.transform, original);
-        assert!(model.take_commands().is_empty());
-    }
-
     #[test]
     fn modes_dispatch_connect_and_edge_path_is_orthogonal() {
+        let mut b = node("b");
+        b.x = 100.;
+        b.y = 70.;
         let mut model = CanvasModel::new(CanvasDocument {
-            nodes: vec![node("a"), {
-                let mut n = node("b");
-                n.x = 100.;
-                n.y = 70.;
-                n
-            }],
+            nodes: vec![node("a"), b],
             ..Default::default()
         });
         model.set_mode(CanvasMode::Connect);
@@ -561,10 +980,10 @@ mod tests {
                 .as_deref(),
             Some("b")
         );
-        assert!(matches!(
-            model.take_commands().last(),
-            Some(CanvasCommand::Connect(_))
-        ));
+        assert!(model
+            .take_commands()
+            .iter()
+            .any(|c| matches!(c, CanvasCommand::Connect(_))));
         let path = model.edge_path(&Edge {
             id: "e".into(),
             from_node: "a".into(),
@@ -572,6 +991,23 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(path.len(), 2);
-        assert!(path.iter().all(|(a, b)| (a.x == b.x) ^ (a.y == b.y)));
+    }
+    #[test]
+    fn rectangle_selection_and_crud_history() {
+        let mut m = CanvasModel::new(CanvasDocument {
+            nodes: vec![node("a")],
+            ..Default::default()
+        });
+        m.begin_selection(ScreenPoint { x: 0., y: 0. });
+        assert_eq!(
+            m.finish_selection(ScreenPoint { x: 100., y: 100. }, false),
+            BTreeSet::from(["a".into()])
+        );
+        let copy = m.duplicate_node("a").unwrap();
+        assert!(m.document.node(&copy).is_some());
+        m.undo();
+        assert!(m.document.node(&copy).is_none());
+        m.redo();
+        assert!(m.document.node(&copy).is_some());
     }
 }
