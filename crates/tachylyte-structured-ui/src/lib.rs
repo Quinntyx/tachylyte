@@ -8,10 +8,14 @@
 
 mod bases;
 mod canvas;
+mod canvas_geometry;
+mod canvas_history;
+mod canvas_input;
 
 pub use bases::{BaseCommand, BaseLayout, BaseModel, BaseProjection, BaseRow, BasesView};
 pub use canvas::{
-    CanvasCommand, CanvasMode, CanvasModel, CanvasTransform, CanvasView, ScreenPoint,
+    CanvasCommand, CanvasContextAction, CanvasMode, CanvasModel, CanvasTransform, CanvasView,
+    ScreenPoint,
 };
 
 /// A single event stream for the two structured views in a workspace.
