@@ -7,12 +7,24 @@
 //! behind their own `--structured-ui` input flag.
 
 mod bases;
+mod bases_formula;
+mod bases_intents;
+mod bases_layout;
 mod canvas;
 mod canvas_geometry;
 mod canvas_history;
 mod canvas_input;
 
-pub use bases::{BaseCommand, BaseLayout, BaseModel, BaseProjection, BaseRow, BasesView};
+pub use bases::{
+    format_value, BaseCommand, BaseLayout, BaseModel, BaseProjection, BaseRow, BaseSummary,
+    BasesEvent, BasesIntent, BasesView, ColumnVisibility, EditCellIntent, FormulaError,
+    ToolbarAction,
+};
+pub use bases_formula::{display_property, evaluate_formula, FormulaDisplay, FormulaSummary};
+pub use bases_intents::{BaseEvent, BaseIntent};
+pub use bases_layout::{
+    layout_label, BasesLayoutState, CardCover, ColumnWidth, LayoutKind, PropertyColumn,
+};
 pub use canvas::{
     CanvasCommand, CanvasContextAction, CanvasMode, CanvasModel, CanvasTransform, CanvasView,
     ScreenPoint,
